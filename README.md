@@ -20,6 +20,9 @@ precedes a melted connector**.
 - **Alerts that reach you** — phone/browser push via [ntfy](https://ntfy.sh), generic JSON
   webhooks, and desktop notifications. A debounced raise/resolve lifecycle sends *one* alert
   per incident (plus periodic reminders), not thousands of per-sample messages.
+- **Prometheus + Grafana** — a built-in exporter (`GET /metrics`) and a ready-made
+  [dashboard](docs/grafana-dashboard.json); scrapes read a cached snapshot and never touch
+  the i2c bus.
 - **Falloff capture** — writes a `GPU_UNREACHABLE` row the instant the GPU drops off the bus,
   so the per-pin state *right before* a crash is preserved.
 - **Read-only & safe** — only ever writes the i2c register pointer, never a data byte (see [Safety](#safety)).
@@ -65,8 +68,20 @@ sudo systemctl enable --now astral-watch
 astral-watch                       # live per-pin display (default)
 astral-watch log gpu-pins.csv      # log to CSV (auto-rotates at 50 MB, keeps 5 backups)
 astral-watch log --interval 0.25   # faster sampling to catch transients
+astral-watch export                # serve Prometheus metrics on 127.0.0.1:9942
 astral-watch --bus 0 --addr 0x2b   # pin the bus/address manually
 ```
+
+For Prometheus alongside CSV logging (e.g. the systemd service), add to the config instead:
+
+```toml
+[export]
+listen = "127.0.0.1:9942"
+```
+
+then import [`docs/grafana-dashboard.json`](docs/grafana-dashboard.json) into Grafana. If you
+alert through Prometheus, pair the metrics with an `absent(astral_watch_up)` (or
+`up{job="..."} == 0`) rule — a dead exporter can't report its own death.
 
 CSV columns: `timestamp, p1_V, p1_A, … p6_V, p6_A, total_A, total_W, balance, alerts`.
 
@@ -105,8 +120,9 @@ See [`docs/SAFETY.md`](docs/SAFETY.md).
 
 - **0.1:** read + decode + alerts + CSV/rotation + service. *(MVP)* ✓
 - **0.1.1:** hardening — CSV integrity, tear-resistant reads, install-path fixes. ✓
-- **0.2 (here):** alert lifecycle (raise/resolve/repeat) + ntfy/webhook/desktop delivery + config file.
-- **next:** Prometheus exporter + Grafana dashboard, a TUI; then releases, crates.io, AUR.
+- **0.2:** alert lifecycle (raise/resolve/repeat) + ntfy/webhook/desktop delivery + config file. ✓
+- **0.3 (here):** Prometheus exporter + Grafana dashboard, unified sampler/sink loop.
+- **next:** releases, crates.io, AUR; a TUI.
 - **later:** opt-in **safety daemon** (auto power-cap via NVML on sustained overload),
   high-rate event-capture ring buffer, multi-GPU identity correlation.
 

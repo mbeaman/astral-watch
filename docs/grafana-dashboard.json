@@ -1,0 +1,157 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "title": "astral-watch — 12V-2x6 per-pin power",
+  "uid": "astral-watch",
+  "tags": ["gpu", "power", "astral-watch"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Watchdog",
+      "description": "Instant query: if the astral-watch process dies, the series goes stale and this panel turns red NO SIGNAL instead of freezing on the last green sample. Pair with an `absent(astral_watch_up)` Prometheus alert.",
+      "id": 1,
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "expr": "astral_watch_up", "instant": true, "refId": "A" }],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "NO DATA", "color": "red" }, "1": { "text": "UP", "color": "green" } } },
+            { "type": "special", "options": { "match": "null", "result": { "text": "NO SIGNAL", "color": "red" } } }
+          ],
+          "noValue": "NO SIGNAL",
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "title": "Reading age",
+      "description": "Instant query so a dead process reads NO SIGNAL, not a frozen age.",
+      "id": 2,
+      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "expr": "astral_watch_last_reading_age_seconds", "instant": true, "refId": "A" }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "mappings": [
+            { "type": "special", "options": { "match": "null", "result": { "text": "NO SIGNAL", "color": "red" } } }
+          ],
+          "noValue": "NO SIGNAL",
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 5 }, { "color": "red", "value": 30 }] }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "value", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "title": "Alerts raised (24h)",
+      "id": 3,
+      "gridPos": { "h": 5, "w": 4, "x": 8, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "expr": "sum(increase(astral_watch_alerts_raised_total[24h]))", "refId": "A" }],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "value", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Total power",
+      "id": 4,
+      "gridPos": { "h": 5, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "expr": "astral_watch_total_watts", "legendFormat": "total W", "refId": "A" }],
+      "fieldConfig": {
+        "defaults": { "unit": "watt", "custom": { "fillOpacity": 15 } },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Per-pin current — uneven pins precede a melt",
+      "id": 5,
+      "gridPos": { "h": 9, "w": 16, "x": 0, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "expr": "astral_watch_pin_amps", "legendFormat": "pin {{pin}}", "refId": "A" }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "amp",
+          "custom": { "fillOpacity": 0, "thresholdsStyle": { "mode": "line" } },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 9.2 }] }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Balance ratio (hi/lo pin current)",
+      "id": 6,
+      "gridPos": { "h": 9, "w": 8, "x": 16, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "expr": "astral_watch_balance_ratio", "legendFormat": "hi/lo", "refId": "A" }],
+      "fieldConfig": {
+        "defaults": {
+          "min": 1,
+          "custom": { "fillOpacity": 10, "thresholdsStyle": { "mode": "line" } },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1.5 }] }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Per-pin voltage",
+      "id": 7,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "expr": "astral_watch_pin_volts", "legendFormat": "pin {{pin}}", "refId": "A" }],
+      "fieldConfig": {
+        "defaults": { "unit": "volt", "custom": { "fillOpacity": 0 } },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "type": "state-timeline",
+      "title": "Active alerts (debounced lifecycle)",
+      "id": 8,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "expr": "astral_watch_alert_active", "legendFormat": "{{condition}}", "refId": "A" }],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "fillOpacity": 70 },
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "ok", "color": "green" }, "1": { "text": "ACTIVE", "color": "red" } } }
+          ]
+        },
+        "overrides": []
+      },
+      "options": { "showValue": "never", "legend": { "displayMode": "list", "placement": "bottom" } }
+    }
+  ]
+}

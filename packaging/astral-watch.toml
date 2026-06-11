@@ -38,3 +38,9 @@
 #[notify.webhook]
 #url = "https://example.com/hook"
 #token = "..."              # sent as Authorization: Bearer
+
+# Prometheus exporter: uncommenting [export] makes every mode serve GET /metrics on
+# this address (the `export` subcommand serves without a config). The endpoint is
+# unauthenticated — bind beyond loopback only on a network you trust.
+#[export]
+#listen = "127.0.0.1:9942"

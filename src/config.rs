@@ -15,6 +15,15 @@ pub struct Config {
     pub thresholds: Thresholds,
     pub alerts: AlertPolicy,
     pub notify: NotifyConfig,
+    pub export: Option<ExportConfig>,
+}
+
+/// Prometheus exporter — presence of the section enables the listener in every mode.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportConfig {
+    /// Listen address, e.g. `127.0.0.1:9942` (bind non-loopback deliberately).
+    pub listen: String,
 }
 
 /// When alerts raise, resolve, and re-notify. Sample-count based: a steady fault confirms
@@ -161,6 +170,14 @@ impl Config {
         }
         if let Some(w) = &self.notify.webhook {
             check_url("notify.webhook.url", &w.url)?;
+        }
+        if let Some(e) = &self.export {
+            if !e.listen.contains(':') {
+                bail!(
+                    "export.listen must be an address:port like 127.0.0.1:9942 (got {:?})",
+                    e.listen
+                );
+            }
         }
         Ok(())
     }

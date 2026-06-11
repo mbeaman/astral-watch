@@ -1,17 +1,21 @@
-//! astral-watch CLI: live per-pin display and CSV logging for ASUS ROG Astral GPUs.
+//! astral-watch CLI: live display, CSV logging, and Prometheus export for ASUS ROG
+//! Astral GPUs — one sampling loop feeding whichever sinks the mode enables.
 
 use anyhow::{bail, Result};
 use astral_watch::alert::evaluate;
 use astral_watch::cards::{detect_gpu, model_for, ASUS_VENDOR};
 use astral_watch::config::{self, Config};
+use astral_watch::exporter;
 use astral_watch::i2c::{autodetect_bus, nvidia_buses, read_reading, CHIP_ADDR_STR};
 use astral_watch::lifecycle::{condition_of, Condition, Lifecycle};
 use astral_watch::logger::CsvLogger;
+use astral_watch::metrics::Metrics;
 use astral_watch::notify::{self, Dispatcher};
 use chrono::Local;
 use clap::{Parser, Subcommand};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -58,6 +62,12 @@ enum Cmd {
         #[arg(long, default_value_t = 5)]
         keep: u32,
     },
+    /// Serve Prometheus metrics (no CSV); monitor/log modes can also export via config
+    Export {
+        /// listen address for GET /metrics (default: config [export].listen, else 127.0.0.1:9942)
+        #[arg(long)]
+        listen: Option<String>,
+    },
 }
 
 fn parse_u16(s: &str) -> Result<u16, String> {
@@ -80,6 +90,7 @@ fn parse_interval(secs: f64) -> Result<Duration> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let cmd = cli.cmd.unwrap_or(Cmd::Monitor);
 
     // config and flag validation first: a typo'd config must fail fast
     let (cfg, cfg_path) = config::load(cli.config.as_deref())?;
@@ -115,49 +126,89 @@ fn main() -> Result<()> {
         eprintln!("# notify: {}", enabled.join(" + "));
     }
 
+    // The exporter binds before bus detection so scrapes see up=0 (not connection
+    // refused) while we wait for a GPU.
+    let cfg_listen = cfg.export.as_ref().map(|e| e.listen.clone());
+    let export_listen = match &cmd {
+        Cmd::Export { listen } => Some(
+            listen
+                .clone()
+                .or(cfg_listen)
+                .unwrap_or_else(|| "127.0.0.1:9942".into()),
+        ),
+        _ => cfg_listen,
+    };
+    let metrics = match export_listen {
+        Some(listen) => {
+            let metrics = Arc::new(Metrics::new());
+            match exporter::spawn(&listen, Arc::clone(&metrics)) {
+                Ok(addr) => {
+                    eprintln!("# metrics: http://{addr}/metrics");
+                    Some(metrics)
+                }
+                // in export mode the listener IS the deliverable — fail fast; in
+                // monitor/log the watchdog must keep sampling without it
+                Err(e) if matches!(cmd, Cmd::Export { .. }) => return Err(e),
+                Err(e) => {
+                    eprintln!("# warning: metrics exporter disabled: {e:#} (watchdog continues)");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
     // The dispatcher and lifecycle exist BEFORE bus detection: a watchdog started during
     // an outage (host reboot after a GPU crash, driver loading late, deeply idle card)
     // must wait and tell someone — not exit into a silent systemd restart loop.
     let dispatcher = Dispatcher::from_config(&cfg.notify);
     let mut lifecycle = Lifecycle::new(cfg.alerts);
-    let bus = acquire_bus(cli.bus, cli.addr, &mut lifecycle, &dispatcher);
+    let bus = acquire_bus(cli.bus, cli.addr, &mut lifecycle, &dispatcher, &metrics);
     eprintln!(
         "# i2c-{bus} @ {:#04x}  interval {}s",
         cli.addr, cli.interval
     );
 
-    match cli.cmd.unwrap_or(Cmd::Monitor) {
-        Cmd::Monitor => run_monitor(bus, cli.addr, interval, &cfg, &dispatcher, lifecycle),
+    let csv = match &cmd {
         Cmd::Log { file, max_mb, keep } => {
-            let target = LogTarget {
-                file: &file,
-                max_mb,
-                keep,
-            };
-            run_log(
-                bus,
-                cli.addr,
-                interval,
-                target,
-                &cfg,
-                &dispatcher,
-                lifecycle,
-            )
+            if !max_mb.is_finite() || *max_mb < 0.0 {
+                bail!("--max-mb must be >= 0 (got {max_mb}); 0 disables rotation");
+            }
+            let max_bytes = (max_mb * 1024.0 * 1024.0) as u64;
+            let log = CsvLogger::open(file, max_bytes, *keep)?;
+            eprintln!(
+                "# logging -> {file}  (Ctrl-C to stop){}",
+                if max_bytes > 0 {
+                    format!("  rotate>{max_mb}MB keep={keep}")
+                } else {
+                    String::new()
+                }
+            );
+            Some(log)
         }
-    }
+        _ => None,
+    };
+
+    let sinks = Sinks {
+        display: matches!(cmd, Cmd::Monitor),
+        csv,
+        metrics,
+    };
+    run(bus, cli.addr, interval, &cfg, &dispatcher, lifecycle, sinks)
 }
 
 /// Detection-retry pause — gentle on the GPU i2c bus, ~15 s to the first notification.
 const ACQUIRE_RETRY: Duration = Duration::from_secs(5);
 
 /// Find the telemetry bus, waiting (and alerting through the lifecycle) instead of
-/// exiting while no GPU answers. A pinned `--bus` is returned as-is; the run loops
-/// handle its read failures the same way.
+/// exiting while no GPU answers. A pinned `--bus` is returned as-is; the run loop
+/// handles its read failures the same way.
 fn acquire_bus(
     pinned: Option<u32>,
     addr: u16,
     lifecycle: &mut Lifecycle,
     dispatcher: &Dispatcher,
+    metrics: &Option<Arc<Metrics>>,
 ) -> u32 {
     if let Some(b) = pinned {
         return b;
@@ -180,6 +231,9 @@ fn acquire_bus(
             "waiting for GPU telemetry (no readable bus)".to_string(),
         );
         for ev in lifecycle.observe(Instant::now(), std::slice::from_ref(&waiting)) {
+            if let Some(m) = metrics {
+                m.on_event(&ev);
+            }
             eprintln!("{ts}  {ev}");
             dispatcher.publish(notify::render(&ev, &ts));
         }
@@ -187,136 +241,128 @@ fn acquire_bus(
     }
 }
 
-fn run_monitor(
+/// Where each sample goes; the loop itself is mode-agnostic.
+struct Sinks {
+    /// Live refreshing terminal line.
+    display: bool,
+    /// Per-sample forensic CSV.
+    csv: Option<CsvLogger>,
+    /// Prometheus cache (shared with the exporter thread).
+    metrics: Option<Arc<Metrics>>,
+}
+
+/// The sampling loop: read → evaluate → feed sinks → debounce → notify.
+///
+/// Per-sample alert text goes to the CSV (forensics); stderr and notifications carry the
+/// debounced lifecycle events. A failing CSV write must never kill the watchdog: it
+/// degrades to a deduplicated warning, and while the CSV is unwritable the per-sample
+/// record is mirrored to stderr so the forensic trail survives a full disk.
+fn run(
     bus: u32,
     addr: u16,
     interval: Duration,
     cfg: &Config,
     dispatcher: &Dispatcher,
     mut lifecycle: Lifecycle,
+    mut sinks: Sinks,
 ) -> Result<()> {
-    loop {
-        let now = Local::now();
-        let ts = now.format("%H:%M:%S").to_string();
-        // webhook consumers get a full ISO timestamp; the short form is display-only
-        let ts_full = now.format("%Y-%m-%dT%H:%M:%S").to_string();
-        let mut conditions: Vec<(Condition, String)> = Vec::new();
-        match read_reading(bus, addr) {
-            Ok(r) if r.plausible() => {
-                let mut line = format!("\r{ts}  ");
-                for (i, p) in r.pins.iter().enumerate() {
-                    line.push_str(&format!("p{} {:5.2}V {:5.2}A  ", i + 1, p.volts, p.amps));
-                }
-                let bal = r
-                    .balance()
-                    .map(|b| format!("{b:.2}"))
-                    .unwrap_or_else(|| "-".into());
-                line.push_str(&format!(
-                    "| {:5.1}A ~{:4.0}W bal {bal}",
-                    r.total_amps(),
-                    r.total_watts()
-                ));
-                let alerts = evaluate(&r, &cfg.thresholds);
-                conditions.extend(alerts.iter().map(|a| (condition_of(a), a.to_string())));
-                if !alerts.is_empty() {
-                    line.push_str(&format!("  !! {}", join(&alerts)));
-                }
-                print!("{line}\x1b[K");
-                std::io::stdout().flush().ok();
-            }
-            Ok(_) => {
-                let msg = "implausible reading (chip answered; wrong device or GPU resetting?)";
-                conditions.push((Condition::TelemetryLost, msg.into()));
-                eprintln!("\n{ts}  *** {msg} ***");
-            }
-            Err(e) => {
-                conditions.push((Condition::TelemetryLost, format!("read failed: {e:#}")));
-                eprintln!("\n{ts}  *** read failed: {e:#} ***");
-            }
-        }
-        for ev in lifecycle.observe(Instant::now(), &conditions) {
-            eprintln!("\n{ts}  {ev}");
-            dispatcher.publish(notify::render(&ev, &ts_full));
-        }
-        sleep(interval);
-    }
-}
-
-struct LogTarget<'a> {
-    file: &'a str,
-    max_mb: f64,
-    keep: u32,
-}
-
-fn run_log(
-    bus: u32,
-    addr: u16,
-    interval: Duration,
-    target: LogTarget,
-    cfg: &Config,
-    dispatcher: &Dispatcher,
-    mut lifecycle: Lifecycle,
-) -> Result<()> {
-    if !target.max_mb.is_finite() || target.max_mb < 0.0 {
-        bail!(
-            "--max-mb must be >= 0 (got {}); 0 disables rotation",
-            target.max_mb
-        );
-    }
-    let max_bytes = (target.max_mb * 1024.0 * 1024.0) as u64;
-    let mut log = CsvLogger::open(target.file, max_bytes, target.keep)?;
-    eprintln!(
-        "# logging -> {}  (Ctrl-C to stop){}",
-        target.file,
-        if max_bytes > 0 {
-            format!("  rotate>{}MB keep={}", target.max_mb, target.keep)
-        } else {
-            String::new()
-        }
-    );
-    // Per-sample alert text goes to the CSV (forensics); stderr and notifications carry the
-    // debounced lifecycle events. A failing CSV write must never kill the watchdog: it
-    // degrades to a deduplicated warning, and while the CSV is unwritable the per-sample
-    // record is mirrored to stderr so the forensic trail survives a full disk.
     let mut log_failing = false;
     loop {
-        let ts = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        let now = Local::now();
+        let ts = now.format("%Y-%m-%dT%H:%M:%S").to_string();
+        // the refreshing display line uses the short form; everything durable gets ISO
+        let ts_disp = now.format("%H:%M:%S").to_string();
         let mut conditions: Vec<(Condition, String)> = Vec::new();
-        let (written, sample_note) = match read_reading(bus, addr) {
+        let mut csv_result: Result<()> = Ok(());
+        let mut sample_note: Option<String> = None;
+
+        match read_reading(bus, addr) {
             Ok(r) if r.plausible() => {
                 let alerts = evaluate(&r, &cfg.thresholds);
                 conditions.extend(alerts.iter().map(|a| (condition_of(a), a.to_string())));
-                let note = (!alerts.is_empty()).then(|| format!("ALERT: {}", join(&alerts)));
-                (log.log(&ts, &r, &alerts), note)
+                if let Some(m) = &sinks.metrics {
+                    m.on_good_sample(&r);
+                }
+                if sinks.display {
+                    let mut line = format!("\r{ts_disp}  ");
+                    for (i, p) in r.pins.iter().enumerate() {
+                        line.push_str(&format!("p{} {:5.2}V {:5.2}A  ", i + 1, p.volts, p.amps));
+                    }
+                    let bal = r
+                        .balance()
+                        .map(|b| format!("{b:.2}"))
+                        .unwrap_or_else(|| "-".into());
+                    line.push_str(&format!(
+                        "| {:5.1}A ~{:4.0}W bal {bal}",
+                        r.total_amps(),
+                        r.total_watts()
+                    ));
+                    if !alerts.is_empty() {
+                        line.push_str(&format!("  !! {}", join(&alerts)));
+                    }
+                    print!("{line}\x1b[K");
+                    std::io::stdout().flush().ok();
+                }
+                if let Some(log) = &mut sinks.csv {
+                    sample_note = (!alerts.is_empty()).then(|| format!("ALERT: {}", join(&alerts)));
+                    csv_result = log.log(&ts, &r, &alerts);
+                }
             }
             Ok(_) => {
-                let msg = "implausible reading (chip answered but data failed sanity checks)";
+                // monitor keeps its v0.2.0 wording (interactive diagnosis hint)
+                let msg = if sinks.display {
+                    "implausible reading (chip answered; wrong device or GPU resetting?)"
+                } else {
+                    "implausible reading (chip answered but data failed sanity checks)"
+                };
                 conditions.push((Condition::TelemetryLost, msg.into()));
-                let written = log.log_unreachable(
-                    &ts,
-                    "IMPLAUSIBLE_READING (chip answered but data failed sanity checks)",
-                );
-                (written, Some("IMPLAUSIBLE_READING".to_string()))
+                if let Some(m) = &sinks.metrics {
+                    m.on_implausible_sample();
+                }
+                if sinks.display {
+                    eprintln!("\n{ts_disp}  *** {msg} ***");
+                }
+                if let Some(log) = &mut sinks.csv {
+                    csv_result = log.log_unreachable(
+                        &ts,
+                        "IMPLAUSIBLE_READING (chip answered but data failed sanity checks)",
+                    );
+                    sample_note = Some("IMPLAUSIBLE_READING".to_string());
+                }
             }
             Err(e) => {
                 conditions.push((Condition::TelemetryLost, format!("read failed: {e:#}")));
-                let written = log.log_unreachable(
-                    &ts,
-                    &format!(
-                        "GPU_UNREACHABLE (read failed: {e:#} - GPU may have fallen off the bus)"
-                    ),
-                );
-                (
-                    written,
-                    Some(format!("GPU_UNREACHABLE (read failed: {e:#})")),
-                )
+                if let Some(m) = &sinks.metrics {
+                    m.on_read_error();
+                }
+                if sinks.display {
+                    eprintln!("\n{ts_disp}  *** read failed: {e:#} ***");
+                }
+                if let Some(log) = &mut sinks.csv {
+                    csv_result = log.log_unreachable(
+                        &ts,
+                        &format!(
+                            "GPU_UNREACHABLE (read failed: {e:#} - GPU may have fallen off the bus)"
+                        ),
+                    );
+                    sample_note = Some(format!("GPU_UNREACHABLE (read failed: {e:#})"));
+                }
             }
-        };
+        }
+
         for ev in lifecycle.observe(Instant::now(), &conditions) {
-            eprintln!("{ts}  {ev}");
+            if let Some(m) = &sinks.metrics {
+                m.on_event(&ev);
+            }
+            if sinks.display {
+                eprintln!("\n{ts_disp}  {ev}");
+            } else {
+                eprintln!("{ts}  {ev}");
+            }
             dispatcher.publish(notify::render(&ev, &ts));
         }
-        match written {
+
+        match csv_result {
             Ok(()) => {
                 if log_failing {
                     eprintln!("{ts}  csv logging recovered");

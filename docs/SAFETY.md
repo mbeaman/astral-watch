@@ -55,9 +55,12 @@ healthy — an active alert can neither confirm from nor "resolve" into a gap in
 and if no readable GPU bus exists at startup, the watchdog waits and raises TELEMETRY LOST
 instead of exiting into a silent restart loop.
 
-Network activity is **opt-in and outbound-only**: nothing listens, and connections are made
-only to the ntfy server / webhook URL you configure. Notification delivery runs on a separate
-thread and can never stall or kill the sampling loop.
+Network activity is **opt-in**: nothing listens and nothing connects out unless configured.
+Outbound connections go only to the ntfy server / webhook URL you set; notification delivery
+runs on separate threads and can never stall or kill the sampling loop. The Prometheus
+exporter (`[export]` config or the `export` subcommand) is the one opt-in listener: it serves
+a read-only, unauthenticated `GET /metrics` from a cached snapshot — a scrape never touches
+the i2c bus — and defaults to loopback; bind it beyond loopback only on a network you trust.
 
 ## What it does *not* do
 

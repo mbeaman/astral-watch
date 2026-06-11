@@ -31,7 +31,8 @@ pub enum Condition {
     TelemetryLost,
 }
 
-const ALL: [Condition; 4] = [
+/// Every condition, in `Condition::idx` order.
+pub const CONDITIONS: [Condition; 4] = [
     Condition::Overload,
     Condition::Disconnected,
     Condition::Imbalance,
@@ -59,7 +60,8 @@ impl Condition {
         }
     }
 
-    fn idx(self) -> usize {
+    /// Position in [`CONDITIONS`].
+    pub(crate) fn idx(self) -> usize {
         match self {
             Condition::Overload => 0,
             Condition::Disconnected => 1,
@@ -173,7 +175,7 @@ impl Lifecycle {
         let confirm = self.policy.confirm_samples as usize;
         let window_len = 2 * confirm - 1;
         let mut events = Vec::new();
-        for cond in ALL {
+        for cond in CONDITIONS {
             let detail = present.iter().find(|(c, _)| *c == cond).map(|(_, d)| d);
             // A telemetry-lost sample says nothing about the physical conditions:
             // freeze their state rather than letting no-data count as health.
