@@ -1,0 +1,44 @@
+# Maintainer: Matt Beaman <matthew.a.beaman@gmail.com>
+pkgname=astral-watch
+pkgver=0.3.0
+pkgrel=1
+pkgdesc="Per-pin 12V-2x6 power monitoring and connector-melt early-warning for ASUS ROG Astral GPUs"
+arch=('x86_64')
+url="https://github.com/mbeaman/astral-watch"
+license=('MIT')
+depends=('gcc-libs')
+makedepends=('cargo')
+backup=('etc/astral-watch.toml')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+# refresh with: updpkgsums  (or curl -L <tarball-url> | sha256sum)
+sha256sums=('UPDATE-ME-ON-RELEASE')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target # package() expects target/release/ regardless of user env
+  cargo build --frozen --release
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo test --frozen --release
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  # install-files skips the cargo rebuild (no network in fakeroot) and, with DESTDIR
+  # set, skips live-system steps; the unit lands in /usr/lib/systemd/system
+  make install-files DESTDIR="$pkgdir" PREFIX=/usr
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 docs/grafana-dashboard.json \
+    "$pkgdir/usr/share/doc/$pkgname/grafana-dashboard.json"
+}

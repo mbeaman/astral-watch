@@ -44,7 +44,13 @@ for naming. Don't see yours? [Add it](CONTRIBUTING.md).
 
 ## Install
 
-Requires Rust (stable) and `i2c-dev`.
+Prebuilt Linux binaries (gnu + static musl) ship on the
+[releases page](https://github.com/mbeaman/astral-watch/releases); an AUR `PKGBUILD` lives in
+[`packaging/aur/`](packaging/aur/). Note that a bare binary (prebuilt, or via
+`cargo install`) is just the binary — the udev rule and systemd service come from
+`make install` or the AUR package.
+
+Building from source requires Rust (1.85+) and `i2c-dev`.
 
 ```sh
 git clone https://github.com/mbeaman/astral-watch
@@ -121,8 +127,9 @@ See [`docs/SAFETY.md`](docs/SAFETY.md).
 - **0.1:** read + decode + alerts + CSV/rotation + service. *(MVP)* ✓
 - **0.1.1:** hardening — CSV integrity, tear-resistant reads, install-path fixes. ✓
 - **0.2:** alert lifecycle (raise/resolve/repeat) + ntfy/webhook/desktop delivery + config file. ✓
-- **0.3 (here):** Prometheus exporter + Grafana dashboard, unified sampler/sink loop.
-- **next:** releases, crates.io, AUR; a TUI.
+- **0.3 (here):** Prometheus exporter + Grafana dashboard, unified sampler/sink loop;
+  release infrastructure — prebuilt binaries, AUR `PKGBUILD`, crates.io packaging.
+- **next:** a TUI.
 - **later:** opt-in **safety daemon** (auto power-cap via NVML on sustained overload),
   high-rate event-capture ring buffer, multi-GPU identity correlation.
 

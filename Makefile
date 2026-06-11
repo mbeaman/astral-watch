@@ -1,9 +1,10 @@
 PREFIX ?= /usr/local
 DESTDIR ?=
-# vendor units in packages belong in /usr/lib; admin-installed units in /etc
+# vendor files in packages belong in /usr/lib; admin-installed ones in /etc
 UNITDIR = $(if $(DESTDIR),/usr/lib/systemd/system,/etc/systemd/system)
+UDEVDIR = $(if $(DESTDIR),/usr/lib/udev/rules.d,/etc/udev/rules.d)
 
-.PHONY: build release test fmt clippy check install uninstall
+.PHONY: build release test fmt clippy check install install-files uninstall
 
 build:
 	cargo build
@@ -22,9 +23,15 @@ clippy:
 
 check: fmt clippy test
 
+# sub-make keeps the build strictly before the file copies, even under `make -j`
 install: release
+	$(MAKE) install-files
+
+# files only, no cargo invocation — for packagers (PKGBUILD package()) whose build step
+# already produced target/release/astral-watch and who must not touch the network here
+install-files:
 	install -Dm755 target/release/astral-watch $(DESTDIR)$(PREFIX)/bin/astral-watch
-	install -Dm644 packaging/99-astral-watch.rules $(DESTDIR)/etc/udev/rules.d/99-astral-watch.rules
+	install -Dm644 packaging/99-astral-watch.rules $(DESTDIR)$(UDEVDIR)/99-astral-watch.rules
 	install -Dm644 packaging/sysusers.d/astral-watch.conf $(DESTDIR)/usr/lib/sysusers.d/astral-watch.conf
 	install -Dm644 packaging/modules-load.d/astral-watch.conf $(DESTDIR)/usr/lib/modules-load.d/astral-watch.conf
 	install -d $(DESTDIR)$(UNITDIR)
@@ -54,7 +61,7 @@ uninstall:
 		systemctl disable --now astral-watch 2>/dev/null || true; \
 	fi
 	rm -f $(DESTDIR)$(PREFIX)/bin/astral-watch
-	rm -f $(DESTDIR)/etc/udev/rules.d/99-astral-watch.rules
+	rm -f $(DESTDIR)$(UDEVDIR)/99-astral-watch.rules
 	rm -f $(DESTDIR)/usr/lib/sysusers.d/astral-watch.conf
 	rm -f $(DESTDIR)/usr/lib/modules-load.d/astral-watch.conf
 	rm -f $(DESTDIR)$(UNITDIR)/astral-watch.service

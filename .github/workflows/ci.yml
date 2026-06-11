@@ -23,5 +23,67 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test --all
+      - name: Doc warnings
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
       - name: Build (release)
-        run: cargo build --release
+        run: cargo build --release --locked
+
+  msrv:
+    name: MSRV (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked --all-targets
+
+  publish-dry-run:
+    name: crates.io packaging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo publish --dry-run --locked
+
+  packaging:
+    name: make install + unit validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Staged install
+        run: make install DESTDIR="$PWD/stage" PREFIX=/usr
+      - name: All artifacts land where packagers expect
+        run: |
+          test -x stage/usr/bin/astral-watch
+          test -f stage/usr/lib/udev/rules.d/99-astral-watch.rules
+          test -f stage/etc/astral-watch.toml
+          test -f stage/usr/lib/systemd/system/astral-watch.service
+          test -f stage/usr/lib/sysusers.d/astral-watch.conf
+          test -f stage/usr/lib/modules-load.d/astral-watch.conf
+          grep -q 'ExecStart=/usr/bin/astral-watch' stage/usr/lib/systemd/system/astral-watch.service
+      - name: Validate systemd unit
+        run: |
+          sudo install -Dm755 stage/usr/bin/astral-watch /usr/bin/astral-watch
+          sudo systemd-sysusers stage/usr/lib/sysusers.d/astral-watch.conf
+          sudo systemd-analyze verify stage/usr/lib/systemd/system/astral-watch.service
+      - name: Validate udev rule
+        run: sudo udevadm verify --resolve-names=never packaging/99-astral-watch.rules
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write # audit-check creates a check run when it finds advisories
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

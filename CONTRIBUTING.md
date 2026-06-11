@@ -40,3 +40,12 @@ against captured byte fixtures, and the i2c layer is only exercised at runtime.
 Keep i2c access **read-only** (register-pointer reads only — never `i2cset`/write-byte). Any PR
 that writes to the device will be rejected unless it's an explicit, documented, opt-in feature
 (e.g. the planned NVML power-cap, which acts via the NVIDIA driver, not raw i2c writes).
+
+## Releasing (maintainer checklist)
+
+1. Bump `version` in `Cargo.toml`, update `CHANGELOG.md` (move changes under the new
+   version with today's date, add the compare link), commit.
+2. `git tag -a vX.Y.Z -m "vX.Y.Z"` and `git push origin main vX.Y.Z` — the release
+   workflow builds gnu + musl tarballs and publishes them atomically once both succeed.
+3. `cargo publish --locked` — CI's `publish-dry-run` job has already validated packaging.
+4. Update the AUR package (see [`packaging/aur/README.md`](packaging/aur/README.md)).

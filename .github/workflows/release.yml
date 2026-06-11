@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Smoke test
+        run: target/${{ matrix.target }}/release/astral-watch --help
+      - name: Package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          name="astral-watch-${version}-${{ matrix.target }}"
+          mkdir "$name"
+          cp target/${{ matrix.target }}/release/astral-watch "$name/"
+          cp README.md CHANGELOG.md LICENSE "$name/"
+          cp -r packaging "$name/packaging"
+          cp -r docs "$name/docs"
+          tar czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarball-${{ matrix.target }}
+          path: |
+            astral-watch-*.tar.gz
+            astral-watch-*.tar.gz.sha256
+          if-no-files-found: error
+
+  # publish atomically, only after every target built — a failed leg must never leave a
+  # public half-empty release on the tag
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            astral-watch-*.tar.gz
+            astral-watch-*.tar.gz.sha256
+          body: >
+            Prebuilt Linux binaries (gnu and static musl). See
+            [CHANGELOG.md](https://github.com/mbeaman/astral-watch/blob/main/CHANGELOG.md)
+            for what changed. For the udev rule + systemd service, run `sudo make install`
+            from a source checkout, or use the AUR package.
