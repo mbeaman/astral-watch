@@ -1,0 +1,40 @@
+# astral-watch configuration — every setting is optional; the values shown are the defaults.
+#
+# The service reads /etc/astral-watch.toml. A user config at
+# ~/.config/astral-watch/config.toml takes precedence, and --config beats both.
+
+[thresholds]
+# Per-pin overload, amps (the ASUS Power Detector+ default).
+#overload_amps = 9.2
+# hi/lo per-pin current ratio considered imbalanced.
+#imbalance_ratio = 1.5
+# Total load (amps) below which imbalance/disconnect are treated as noise.
+#min_load_amps = 5.0
+
+[alerts]
+# An alert raises once the condition is seen in confirm_samples of the last
+# 2×confirm_samples−1 samples (majority vote — 3-of-5 by default). A steady fault
+# confirms in confirm_samples × interval (1.5 s for the shipped service at 0.5 s).
+#confirm_samples = 3
+# Consecutive clean samples before an active alert resolves.
+#resolve_samples = 20
+# Re-notify while an alert stays active, minutes (0 = notify once per incident).
+#repeat_minutes = 10
+
+[notify]
+# Desktop notifications via notify-send — works when run in a desktop session,
+# not from the system service (it has no session bus).
+#desktop = false
+
+# Phone/browser push via ntfy (https://ntfy.sh or self-hosted).
+# On a public server the topic *is* the secret — pick something unguessable.
+#[notify.ntfy]
+#url = "https://ntfy.sh"
+#topic = "change-me-gpu-alerts-x7k2q"
+#token = "tk_..."           # only needed for protected topics
+
+# Generic webhook: POSTs a JSON document
+#   {"source","event","condition","title","detail","priority","timestamp"}
+#[notify.webhook]
+#url = "https://example.com/hook"
+#token = "..."              # sent as Authorization: Bearer

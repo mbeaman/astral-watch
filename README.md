@@ -17,6 +17,9 @@ precedes a melted connector**.
 - **Live per-pin display** — voltage, current, total, and balance ratio, refreshing in place.
 - **CSV logging with rotation** — continuous, append-only, self-rotating; survives reboots as a service.
 - **Alerts** — per-pin overload (`>9.2 A`), disconnect (`~0 A` under load), and imbalance (`hi/lo > 1.5×`).
+- **Alerts that reach you** — phone/browser push via [ntfy](https://ntfy.sh), generic JSON
+  webhooks, and desktop notifications. A debounced raise/resolve lifecycle sends *one* alert
+  per incident (plus periodic reminders), not thousands of per-sample messages.
 - **Falloff capture** — writes a `GPU_UNREACHABLE` row the instant the GPU drops off the bus,
   so the per-pin state *right before* a crash is preserved.
 - **Read-only & safe** — only ever writes the i2c register pointer, never a data byte (see [Safety](#safety)).
@@ -67,6 +70,24 @@ astral-watch --bus 0 --addr 0x2b   # pin the bus/address manually
 
 CSV columns: `timestamp, p1_V, p1_A, … p6_V, p6_A, total_A, total_W, balance, alerts`.
 
+## Configuration
+
+Optional TOML config: `/etc/astral-watch.toml` (the service reads this; `make install` puts a
+fully commented example there), overridden by `~/.config/astral-watch/config.toml`, overridden
+by `--config PATH`. Everything has safe defaults; the part most people want:
+
+```toml
+[notify.ntfy]
+topic = "your-unguessable-topic"   # then subscribe in the ntfy app — that's it
+```
+
+Thresholds, the alert confirm/resolve windows, re-notification cadence, webhooks, and desktop
+notifications are covered in the example file ([`packaging/astral-watch.toml`](packaging/astral-watch.toml)).
+An alert raises once the condition is seen in 3 of the last 5 samples (1.5 s for a steady
+fault as the shipped service samples at 0.5 s — and an oscillating one still confirms) and
+resolves after 20 consecutive clean samples; both are configurable. No-data samples never
+count as healthy: telemetry loss can't fake an all-clear.
+
 ## How it works
 
 The IT8915FN sits at i2c address `0x2B` on the GPU's own NVIDIA i2c adapter. Register `0x80`
@@ -82,9 +103,12 @@ See [`docs/SAFETY.md`](docs/SAFETY.md).
 
 ## Roadmap
 
-- **0.1 (here):** read + decode + alerts + CSV/rotation + service. *(MVP)*
-- **0.2:** Prometheus exporter + Grafana dashboard, a `rich` TUI, desktop/ntfy/webhook alerts, AUR package.
-- **0.3:** opt-in **safety daemon** (auto power-cap via NVML on sustained overload), high-rate event-capture ring buffer.
+- **0.1:** read + decode + alerts + CSV/rotation + service. *(MVP)* ✓
+- **0.1.1:** hardening — CSV integrity, tear-resistant reads, install-path fixes. ✓
+- **0.2 (here):** alert lifecycle (raise/resolve/repeat) + ntfy/webhook/desktop delivery + config file.
+- **next:** Prometheus exporter + Grafana dashboard, a TUI; then releases, crates.io, AUR.
+- **later:** opt-in **safety daemon** (auto power-cap via NVML on sustained overload),
+  high-rate event-capture ring buffer, multi-GPU identity correlation.
 
 ## Credits
 

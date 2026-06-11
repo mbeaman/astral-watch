@@ -3,13 +3,17 @@
 use anyhow::{bail, Result};
 use astral_watch::alert::evaluate;
 use astral_watch::cards::{detect_gpu, model_for, ASUS_VENDOR};
+use astral_watch::config::{self, Config};
 use astral_watch::i2c::{autodetect_bus, nvidia_buses, read_reading, CHIP_ADDR_STR};
+use astral_watch::lifecycle::{condition_of, Condition, Lifecycle};
 use astral_watch::logger::CsvLogger;
+use astral_watch::notify::{self, Dispatcher};
 use chrono::Local;
 use clap::{Parser, Subcommand};
 use std::io::Write;
+use std::path::PathBuf;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 #[command(
@@ -32,6 +36,10 @@ struct Cli {
     /// seconds between samples
     #[arg(long, global = true, default_value_t = 1.0)]
     interval: f64,
+
+    /// config file (default: ~/.config/astral-watch/config.toml, then /etc/astral-watch.toml)
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -73,6 +81,19 @@ fn parse_interval(secs: f64) -> Result<Duration> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // config and flag validation first: a typo'd config must fail fast
+    let (cfg, cfg_path) = config::load(cli.config.as_deref())?;
+    for w in cfg.warnings() {
+        eprintln!("# warning: {w}");
+    }
+    let interval = parse_interval(cli.interval)?;
+    if cli.interval < 0.05 {
+        eprintln!(
+            "# warning: --interval {} hammers the GPU i2c bus (shared with display traffic)",
+            cli.interval
+        );
+    }
+
     if let Some((pci, sv, sd)) = detect_gpu() {
         let model =
             model_for(sd).unwrap_or("unknown — not in card DB (still works if the chip answers)");
@@ -82,39 +103,104 @@ fn main() -> Result<()> {
         }
     }
 
-    if nvidia_buses().is_empty() {
-        bail!("no NVIDIA i2c buses found — is i2c-dev loaded?  `sudo modprobe i2c-dev`");
+    eprintln!(
+        "# config: {}",
+        cfg_path
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "built-in defaults".into())
+    );
+    let enabled = cfg.notify.enabled();
+    if !enabled.is_empty() {
+        eprintln!("# notify: {}", enabled.join(" + "));
     }
 
-    let bus = match cli.bus {
-        Some(b) => b,
-        None => autodetect_bus(cli.addr).ok_or_else(|| {
-            anyhow::anyhow!(
-                "no valid per-pin telemetry on any NVIDIA bus (GPU deeply idle? run under load, or pass --bus N)"
-            )
-        })?,
-    };
+    // The dispatcher and lifecycle exist BEFORE bus detection: a watchdog started during
+    // an outage (host reboot after a GPU crash, driver loading late, deeply idle card)
+    // must wait and tell someone — not exit into a silent systemd restart loop.
+    let dispatcher = Dispatcher::from_config(&cfg.notify);
+    let mut lifecycle = Lifecycle::new(cfg.alerts);
+    let bus = acquire_bus(cli.bus, cli.addr, &mut lifecycle, &dispatcher);
     eprintln!(
         "# i2c-{bus} @ {:#04x}  interval {}s",
         cli.addr, cli.interval
     );
 
-    let interval = parse_interval(cli.interval)?;
-    if cli.interval < 0.05 {
-        eprintln!(
-            "# warning: --interval {} hammers the GPU i2c bus (shared with display traffic)",
-            cli.interval
-        );
-    }
     match cli.cmd.unwrap_or(Cmd::Monitor) {
-        Cmd::Monitor => run_monitor(bus, cli.addr, interval),
-        Cmd::Log { file, max_mb, keep } => run_log(bus, cli.addr, interval, &file, max_mb, keep),
+        Cmd::Monitor => run_monitor(bus, cli.addr, interval, &cfg, &dispatcher, lifecycle),
+        Cmd::Log { file, max_mb, keep } => {
+            let target = LogTarget {
+                file: &file,
+                max_mb,
+                keep,
+            };
+            run_log(
+                bus,
+                cli.addr,
+                interval,
+                target,
+                &cfg,
+                &dispatcher,
+                lifecycle,
+            )
+        }
     }
 }
 
-fn run_monitor(bus: u32, addr: u16, interval: Duration) -> Result<()> {
+/// Detection-retry pause — gentle on the GPU i2c bus, ~15 s to the first notification.
+const ACQUIRE_RETRY: Duration = Duration::from_secs(5);
+
+/// Find the telemetry bus, waiting (and alerting through the lifecycle) instead of
+/// exiting while no GPU answers. A pinned `--bus` is returned as-is; the run loops
+/// handle its read failures the same way.
+fn acquire_bus(
+    pinned: Option<u32>,
+    addr: u16,
+    lifecycle: &mut Lifecycle,
+    dispatcher: &Dispatcher,
+) -> u32 {
+    if let Some(b) = pinned {
+        return b;
+    }
+    let mut quiet = false;
     loop {
-        let ts = Local::now().format("%H:%M:%S");
+        if nvidia_buses().is_empty() {
+            if !quiet {
+                eprintln!("# no NVIDIA i2c buses found — is i2c-dev loaded?  `sudo modprobe i2c-dev`  (will keep checking)");
+            }
+        } else if let Some(b) = autodetect_bus(addr) {
+            return b;
+        } else if !quiet {
+            eprintln!("# no per-pin telemetry on any NVIDIA bus yet (GPU deeply idle? run under load, or pass --bus N)  (will keep checking)");
+        }
+        quiet = true;
+        let ts = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        let waiting = (
+            Condition::TelemetryLost,
+            "waiting for GPU telemetry (no readable bus)".to_string(),
+        );
+        for ev in lifecycle.observe(Instant::now(), std::slice::from_ref(&waiting)) {
+            eprintln!("{ts}  {ev}");
+            dispatcher.publish(notify::render(&ev, &ts));
+        }
+        sleep(ACQUIRE_RETRY);
+    }
+}
+
+fn run_monitor(
+    bus: u32,
+    addr: u16,
+    interval: Duration,
+    cfg: &Config,
+    dispatcher: &Dispatcher,
+    mut lifecycle: Lifecycle,
+) -> Result<()> {
+    loop {
+        let now = Local::now();
+        let ts = now.format("%H:%M:%S").to_string();
+        // webhook consumers get a full ISO timestamp; the short form is display-only
+        let ts_full = now.format("%Y-%m-%dT%H:%M:%S").to_string();
+        let mut conditions: Vec<(Condition, String)> = Vec::new();
         match read_reading(bus, addr) {
             Ok(r) if r.plausible() => {
                 let mut line = format!("\r{ts}  ");
@@ -130,71 +216,106 @@ fn run_monitor(bus: u32, addr: u16, interval: Duration) -> Result<()> {
                     r.total_amps(),
                     r.total_watts()
                 ));
-                let alerts = evaluate(&r);
+                let alerts = evaluate(&r, &cfg.thresholds);
+                conditions.extend(alerts.iter().map(|a| (condition_of(a), a.to_string())));
                 if !alerts.is_empty() {
                     line.push_str(&format!("  !! {}", join(&alerts)));
                 }
                 print!("{line}\x1b[K");
                 std::io::stdout().flush().ok();
             }
-            Ok(_) => eprintln!("\n{ts}  *** implausible reading (chip answered; wrong device or GPU resetting?) ***"),
-            Err(e) => eprintln!("\n{ts}  *** read failed: {e:#} ***"),
+            Ok(_) => {
+                let msg = "implausible reading (chip answered; wrong device or GPU resetting?)";
+                conditions.push((Condition::TelemetryLost, msg.into()));
+                eprintln!("\n{ts}  *** {msg} ***");
+            }
+            Err(e) => {
+                conditions.push((Condition::TelemetryLost, format!("read failed: {e:#}")));
+                eprintln!("\n{ts}  *** read failed: {e:#} ***");
+            }
+        }
+        for ev in lifecycle.observe(Instant::now(), &conditions) {
+            eprintln!("\n{ts}  {ev}");
+            dispatcher.publish(notify::render(&ev, &ts_full));
         }
         sleep(interval);
     }
+}
+
+struct LogTarget<'a> {
+    file: &'a str,
+    max_mb: f64,
+    keep: u32,
 }
 
 fn run_log(
     bus: u32,
     addr: u16,
     interval: Duration,
-    file: &str,
-    max_mb: f64,
-    keep: u32,
+    target: LogTarget,
+    cfg: &Config,
+    dispatcher: &Dispatcher,
+    mut lifecycle: Lifecycle,
 ) -> Result<()> {
-    if !max_mb.is_finite() || max_mb < 0.0 {
-        bail!("--max-mb must be >= 0 (got {max_mb}); 0 disables rotation");
+    if !target.max_mb.is_finite() || target.max_mb < 0.0 {
+        bail!(
+            "--max-mb must be >= 0 (got {}); 0 disables rotation",
+            target.max_mb
+        );
     }
-    let max_bytes = (max_mb * 1024.0 * 1024.0) as u64;
-    let mut log = CsvLogger::open(file, max_bytes, keep)?;
+    let max_bytes = (target.max_mb * 1024.0 * 1024.0) as u64;
+    let mut log = CsvLogger::open(target.file, max_bytes, target.keep)?;
     eprintln!(
-        "# logging -> {file}  (Ctrl-C to stop){}",
+        "# logging -> {}  (Ctrl-C to stop){}",
+        target.file,
         if max_bytes > 0 {
-            format!("  rotate>{max_mb}MB keep={keep}")
+            format!("  rotate>{}MB keep={}", target.max_mb, target.keep)
         } else {
             String::new()
         }
     );
-    // A failing CSV write must never kill the watchdog or eat an alert: alerts go to
-    // stderr first, write errors degrade to a (de-duplicated) warning and we keep sampling.
+    // Per-sample alert text goes to the CSV (forensics); stderr and notifications carry the
+    // debounced lifecycle events. A failing CSV write must never kill the watchdog: it
+    // degrades to a deduplicated warning, and while the CSV is unwritable the per-sample
+    // record is mirrored to stderr so the forensic trail survives a full disk.
     let mut log_failing = false;
     loop {
         let ts = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-        let written = match read_reading(bus, addr) {
+        let mut conditions: Vec<(Condition, String)> = Vec::new();
+        let (written, sample_note) = match read_reading(bus, addr) {
             Ok(r) if r.plausible() => {
-                let alerts = evaluate(&r);
-                if !alerts.is_empty() {
-                    eprintln!("{ts}  ALERT: {}", join(&alerts));
-                }
-                log.log(&ts, &r, &alerts)
+                let alerts = evaluate(&r, &cfg.thresholds);
+                conditions.extend(alerts.iter().map(|a| (condition_of(a), a.to_string())));
+                let note = (!alerts.is_empty()).then(|| format!("ALERT: {}", join(&alerts)));
+                (log.log(&ts, &r, &alerts), note)
             }
             Ok(_) => {
-                eprintln!("\n{ts}  *** IMPLAUSIBLE_READING ***");
-                log.log_unreachable(
+                let msg = "implausible reading (chip answered but data failed sanity checks)";
+                conditions.push((Condition::TelemetryLost, msg.into()));
+                let written = log.log_unreachable(
                     &ts,
                     "IMPLAUSIBLE_READING (chip answered but data failed sanity checks)",
-                )
+                );
+                (written, Some("IMPLAUSIBLE_READING".to_string()))
             }
             Err(e) => {
-                eprintln!("\n{ts}  *** GPU_UNREACHABLE ***");
-                log.log_unreachable(
+                conditions.push((Condition::TelemetryLost, format!("read failed: {e:#}")));
+                let written = log.log_unreachable(
                     &ts,
                     &format!(
                         "GPU_UNREACHABLE (read failed: {e:#} - GPU may have fallen off the bus)"
                     ),
+                );
+                (
+                    written,
+                    Some(format!("GPU_UNREACHABLE (read failed: {e:#})")),
                 )
             }
         };
+        for ev in lifecycle.observe(Instant::now(), &conditions) {
+            eprintln!("{ts}  {ev}");
+            dispatcher.publish(notify::render(&ev, &ts));
+        }
         match written {
             Ok(()) => {
                 if log_failing {
@@ -204,8 +325,11 @@ fn run_log(
             }
             Err(e) => {
                 if !log_failing {
-                    eprintln!("{ts}  csv write failed: {e:#} (alerts still reach stderr; retrying every sample)");
+                    eprintln!("{ts}  csv write failed: {e:#} (mirroring per-sample alerts to stderr until logging recovers)");
                     log_failing = true;
+                }
+                if let Some(note) = sample_note {
+                    eprintln!("{ts}  {note}");
                 }
             }
         }

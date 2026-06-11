@@ -31,6 +31,11 @@ install: release
 	sed 's|/usr/local/bin/|$(PREFIX)/bin/|' packaging/astral-watch.service \
 		> $(DESTDIR)$(UNITDIR)/astral-watch.service
 	chmod 644 $(DESTDIR)$(UNITDIR)/astral-watch.service
+	@if [ -n "$(DESTDIR)" ] || [ ! -e /etc/astral-watch.toml ]; then \
+		install -Dm644 packaging/astral-watch.toml $(DESTDIR)/etc/astral-watch.toml; \
+	else \
+		echo "keeping existing /etc/astral-watch.toml"; \
+	fi
 	@if [ -z "$(DESTDIR)" ]; then \
 		{ modprobe i2c-dev || true; } && \
 		systemd-sysusers && \

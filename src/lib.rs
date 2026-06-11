@@ -8,6 +8,9 @@
 
 pub mod alert;
 pub mod cards;
+pub mod config;
 pub mod decode;
 pub mod i2c;
+pub mod lifecycle;
 pub mod logger;
+pub mod notify;

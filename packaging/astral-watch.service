@@ -26,7 +26,8 @@ ProtectHome=true
 PrivateTmp=true
 ProtectControlGroups=true
 ProtectKernelTunables=true
-RestrictAddressFamilies=AF_UNIX
+# AF_INET/AF_INET6 so configured ntfy/webhook notifications can leave the box
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 DevicePolicy=closed
 DeviceAllow=char-i2c rw
 

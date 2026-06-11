@@ -142,7 +142,7 @@ impl CsvLogger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::alert::evaluate;
+    use crate::alert::{evaluate, Thresholds};
     use crate::decode::{Pin, Reading};
 
     fn sample() -> Reading {
@@ -243,7 +243,7 @@ mod tests {
         r.pins[0].amps = 9.5;
         r.pins[1].amps = 9.6;
         r.pins[2].amps = 0.0;
-        let alerts = evaluate(&r);
+        let alerts = evaluate(&r, &Thresholds::default());
         assert!(alerts.len() >= 2);
         log.log("2026-01-01T00:00:00", &r, &alerts).unwrap();
 

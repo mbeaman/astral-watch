@@ -37,7 +37,29 @@ Linux with no side effects.
 - **Least privilege.** The provided systemd unit runs as an unprivileged user in the `i2c` group,
   granted access to only the NVIDIA i2c nodes via the shipped udev rule.
 
-## What it does *not* do (in 0.1)
+## Alerting and time-to-alert
+
+Notifications are debounced with a majority window: an alert raises once the condition is
+seen in `confirm_samples` of the last `2 × confirm_samples − 1` samples (default 3-of-5).
+A steady fault therefore confirms in 3 consecutive samples — **1.5 s** at the shipped
+service's 0.5 s interval — and a fault oscillating at the sample rate (a pin current
+hovering around the threshold) still confirms instead of being reset by every clean sample.
+This is a deliberate trade: it filters isolated glitches (which would otherwise page you at
+3 a.m. for nothing and teach you to mute the tool) at the cost of ~1 s of added latency on
+a real fault — negligible against the minutes-to-hours timescale of a connector heating
+toward failure. The per-sample CSV record is **not** debounced; every raw sample lands in
+the log.
+
+Two rules guard against false all-clears: telemetry-loss samples count as *unknown*, not
+healthy — an active alert can neither confirm from nor "resolve" into a gap in the data —
+and if no readable GPU bus exists at startup, the watchdog waits and raises TELEMETRY LOST
+instead of exiting into a silent restart loop.
+
+Network activity is **opt-in and outbound-only**: nothing listens, and connections are made
+only to the ntfy server / webhook URL you configure. Notification delivery runs on a separate
+thread and can never stall or kill the sampling loop.
+
+## What it does *not* do
 
 No writes, no power/clock/fan control, no NVML actions. A future opt-in safety daemon may cap GPU
 power on sustained overload — but that will act through the **NVIDIA driver (NVML)**, never via raw

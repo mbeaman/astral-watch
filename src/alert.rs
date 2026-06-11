@@ -1,6 +1,7 @@
 //! Per-pin alert evaluation — the connector-melt early-warning.
 
 use crate::decode::Reading;
+use serde::Deserialize;
 use std::fmt;
 
 /// ASUS Power Detector+ per-pin overload threshold (amps).
@@ -11,20 +12,45 @@ pub const IMBALANCE_RATIO: f64 = 1.5;
 /// per-pin currents are tiny and the ratio is just noise.
 pub const MIN_LOAD_A: f64 = 5.0;
 
+/// Alert thresholds; the defaults match ASUS Power Detector+, overridable via the
+/// `[thresholds]` config section.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Thresholds {
+    /// Per-pin overload (amps).
+    pub overload_amps: f64,
+    /// hi/lo per-pin current ratio considered imbalanced.
+    pub imbalance_ratio: f64,
+    /// Total load (amps) below which imbalance/disconnect are noise.
+    pub min_load_amps: f64,
+}
+
+impl Default for Thresholds {
+    fn default() -> Self {
+        Self {
+            overload_amps: OVERLOAD_A,
+            imbalance_ratio: IMBALANCE_RATIO,
+            min_load_amps: MIN_LOAD_A,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Alert {
     /// One or more pins exceeded the overload threshold.
-    Overload(Vec<usize>),
+    Overload { pins: Vec<usize>, limit: f64 },
     /// One or more pins read ~0 A while the card is under load (lost contact).
     Disconnected(Vec<usize>),
-    /// hi/lo current ratio exceeded [`IMBALANCE_RATIO`].
+    /// hi/lo current ratio exceeded the imbalance threshold.
     Imbalance(f64),
 }
 
 impl fmt::Display for Alert {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Alert::Overload(p) => write!(f, "OVERLOAD pins {} >{OVERLOAD_A}A", join_pins(p)),
+            Alert::Overload { pins, limit } => {
+                write!(f, "OVERLOAD pins {} >{limit}A", join_pins(pins))
+            }
             Alert::Disconnected(p) => {
                 write!(f, "DISCONNECTED? pins {} ~0A under load", join_pins(p))
             }
@@ -42,21 +68,24 @@ fn join_pins(pins: &[usize]) -> String {
 }
 
 /// Evaluate a reading into zero or more alerts.
-pub fn evaluate(r: &Reading) -> Vec<Alert> {
+pub fn evaluate(r: &Reading, t: &Thresholds) -> Vec<Alert> {
     let amps: Vec<f64> = r.pins.iter().map(|p| p.amps).collect();
     let mut out = Vec::new();
 
     let over: Vec<usize> = amps
         .iter()
         .enumerate()
-        .filter(|(_, &a)| a > OVERLOAD_A)
+        .filter(|(_, &a)| a > t.overload_amps)
         .map(|(i, _)| i + 1)
         .collect();
     if !over.is_empty() {
-        out.push(Alert::Overload(over));
+        out.push(Alert::Overload {
+            pins: over,
+            limit: t.overload_amps,
+        });
     }
 
-    if amps.iter().sum::<f64>() > MIN_LOAD_A {
+    if amps.iter().sum::<f64>() > t.min_load_amps {
         let dead: Vec<usize> = amps
             .iter()
             .enumerate()
@@ -67,7 +96,7 @@ pub fn evaluate(r: &Reading) -> Vec<Alert> {
             out.push(Alert::Disconnected(dead));
         }
         if let Some(bal) = r.balance() {
-            if bal > IMBALANCE_RATIO {
+            if bal > t.imbalance_ratio {
                 out.push(Alert::Imbalance(bal));
             }
         }
@@ -89,28 +118,32 @@ mod tests {
         }
     }
 
+    fn eval(amps: [f64; 6]) -> Vec<Alert> {
+        evaluate(&reading(amps), &Thresholds::default())
+    }
+
     #[test]
     fn healthy_balanced_has_no_alerts() {
-        assert!(evaluate(&reading([8.1, 8.3, 8.2, 8.4, 8.5, 8.6])).is_empty());
+        assert!(eval([8.1, 8.3, 8.2, 8.4, 8.5, 8.6]).is_empty());
     }
 
     #[test]
     fn overload_flagged() {
-        assert!(evaluate(&reading([9.5, 8.0, 8.0, 8.0, 8.0, 8.0]))
+        assert!(eval([9.5, 8.0, 8.0, 8.0, 8.0, 8.0])
             .iter()
-            .any(|a| matches!(a, Alert::Overload(_))));
+            .any(|a| matches!(a, Alert::Overload { .. })));
     }
 
     #[test]
     fn disconnect_flagged_under_load() {
-        assert!(evaluate(&reading([0.0, 9.0, 9.0, 9.0, 9.0, 9.0]))
+        assert!(eval([0.0, 9.0, 9.0, 9.0, 9.0, 9.0])
             .iter()
             .any(|a| matches!(a, Alert::Disconnected(_))));
     }
 
     #[test]
     fn imbalance_flagged() {
-        assert!(evaluate(&reading([12.0, 5.0, 8.0, 8.0, 8.0, 8.0]))
+        assert!(eval([12.0, 5.0, 8.0, 8.0, 8.0, 8.0])
             .iter()
             .any(|a| matches!(a, Alert::Imbalance(_))));
     }
@@ -118,13 +151,31 @@ mod tests {
     #[test]
     fn idle_noise_not_flagged() {
         // big ratio but tiny absolute load -> ignored
-        assert!(evaluate(&reading([0.4, 0.6, 0.5, 0.5, 0.6, 0.7])).is_empty());
+        assert!(eval([0.4, 0.6, 0.5, 0.5, 0.6, 0.7]).is_empty());
+    }
+
+    #[test]
+    fn custom_thresholds_honored() {
+        let strict = Thresholds {
+            overload_amps: 8.0,
+            ..Thresholds::default()
+        };
+        let alerts = evaluate(&reading([8.5, 7.0, 7.0, 7.0, 7.0, 7.0]), &strict);
+        match &alerts[..] {
+            [Alert::Overload { pins, limit }] => {
+                assert_eq!(pins, &vec![1]);
+                assert_eq!(*limit, 8.0);
+                // the configured limit shows up in the alert text, not the default
+                assert!(alerts[0].to_string().contains(">8A"));
+            }
+            other => panic!("expected one overload, got {other:?}"),
+        }
     }
 
     #[test]
     fn multi_pin_alert_text_has_no_commas() {
         // alert text lands in a CSV field; commas would break column alignment
-        let alerts = evaluate(&reading([9.5, 9.6, 0.0, 8.0, 8.0, 8.0]));
+        let alerts = eval([9.5, 9.6, 0.0, 8.0, 8.0, 8.0]);
         assert!(alerts.len() >= 2, "expected overload + disconnect");
         for a in &alerts {
             let s = a.to_string();
