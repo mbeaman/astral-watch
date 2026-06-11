@@ -3,6 +3,7 @@
 use crate::alert::Alert;
 use crate::decode::Reading;
 use anyhow::{Context, Result};
+use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
@@ -26,16 +27,26 @@ fn header() -> String {
     h
 }
 
+/// RFC-4180-quote a field when it contains a comma, quote, or line break; pass through otherwise.
+fn csv_field(s: &str) -> Cow<'_, str> {
+    if s.contains([',', '"', '\n', '\r']) {
+        Cow::Owned(format!("\"{}\"", s.replace('"', "\"\"")))
+    } else {
+        Cow::Borrowed(s)
+    }
+}
+
 impl CsvLogger {
     pub fn open(path: impl AsRef<Path>, max_bytes: u64, keep: u32) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let is_new = !path.exists();
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .with_context(|| format!("opening log {}", path.display()))?;
-        if is_new {
+        // header on any empty file — also covers a pre-created file (touch/truncate) and a
+        // previous instance killed between create and header write
+        if file.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
             file.write_all(header().as_bytes())?;
         }
         Ok(Self {
@@ -65,15 +76,15 @@ impl CsvLogger {
             r.total_amps(),
             r.total_watts(),
             bal,
-            al
+            csv_field(&al)
         );
         self.write(&row)
     }
 
-    /// Record that the chip was unreachable (e.g. the GPU fell off the bus).
+    /// Record a sample with no usable reading (chip unreachable or data implausible).
     pub fn log_unreachable(&mut self, ts: &str, msg: &str) -> Result<()> {
         // 17 columns: timestamp, then empty through `balance`, msg in `alerts`.
-        let row = format!("{ts}{}{msg}\n", ",".repeat(16));
+        let row = format!("{ts}{}{}\n", ",".repeat(16), csv_field(msg));
         self.write(&row)
     }
 
@@ -92,19 +103,37 @@ impl CsvLogger {
 
     fn rotate(&mut self) -> Result<()> {
         let suffix = |i: u32| PathBuf::from(format!("{}.{i}", self.path.display()));
-        let _ = fs::remove_file(suffix(self.keep));
-        for i in (1..self.keep).rev() {
-            if suffix(i).exists() {
-                let _ = fs::rename(suffix(i), suffix(i + 1));
+        let warn = |what: &str, e: std::io::Error| {
+            eprintln!("# log rotation: {what} failed: {e} (continuing)");
+        };
+        if self.keep == 0 {
+            // keep=0: no backups — drop the full log and start fresh
+            if let Err(e) = fs::remove_file(&self.path) {
+                warn("removing full log", e);
+            }
+        } else {
+            let _ = fs::remove_file(suffix(self.keep)); // oldest backup; may not exist
+            for i in (1..self.keep).rev() {
+                if suffix(i).exists() {
+                    if let Err(e) = fs::rename(suffix(i), suffix(i + 1)) {
+                        warn("shifting backup", e);
+                    }
+                }
+            }
+            if let Err(e) = fs::rename(&self.path, suffix(1)) {
+                warn("renaming full log", e);
             }
         }
-        let _ = fs::rename(&self.path, suffix(1));
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)
             .with_context(|| format!("reopening log {}", self.path.display()))?;
-        file.write_all(header().as_bytes())?;
+        // only on a fresh file — if the rename above failed we're still appending to the
+        // old data and must not inject a header mid-file
+        if file.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
+            file.write_all(header().as_bytes())?;
+        }
         self.file = file;
         Ok(())
     }
@@ -113,6 +142,7 @@ impl CsvLogger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alert::evaluate;
     use crate::decode::{Pin, Reading};
 
     fn sample() -> Reading {
@@ -124,10 +154,37 @@ mod tests {
         }
     }
 
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("astral-watch-test-{tag}-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// Split one CSV row into fields, honoring RFC-4180 quoting.
+    fn fields(row: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        let mut quoted = false;
+        let mut chars = row.trim_end_matches('\n').chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '"' if quoted && chars.peek() == Some(&'"') => {
+                    cur.push('"');
+                    chars.next();
+                }
+                '"' => quoted = !quoted,
+                ',' if !quoted => out.push(std::mem::take(&mut cur)),
+                c => cur.push(c),
+            }
+        }
+        out.push(cur);
+        out
+    }
+
     #[test]
     fn writes_header_and_rotates() {
-        let dir = std::env::temp_dir().join(format!("astral-watch-test-{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
+        let dir = tmp_dir("rotate");
         let path = dir.join("t.csv");
         let _ = fs::remove_file(&path);
         // tiny cap so it rotates quickly
@@ -142,6 +199,65 @@ mod tests {
             head.starts_with("timestamp,"),
             "rotated file keeps a header"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn header_added_to_preexisting_empty_file() {
+        let dir = tmp_dir("empty");
+        let path = dir.join("t.csv");
+        fs::write(&path, b"").unwrap(); // e.g. admin pre-created it with touch+chown
+        let mut log = CsvLogger::open(&path, 0, 0).unwrap();
+        log.log("2026-01-01T00:00:00", &sample(), &[]).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("timestamp,"), "missing header: {text}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keep_zero_rotates_without_backups() {
+        let dir = tmp_dir("keep0");
+        let path = dir.join("t.csv");
+        let _ = fs::remove_file(&path);
+        let mut log = CsvLogger::open(&path, 200, 0).unwrap();
+        for _ in 0..200 {
+            log.log("2026-01-01T00:00:00", &sample(), &[]).unwrap();
+        }
+        assert!(path.exists(), "live log exists");
+        assert!(
+            !dir.join("t.csv.1").exists(),
+            "keep=0 must not leave a backup"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_pin_alert_row_stays_17_columns() {
+        let dir = tmp_dir("quote");
+        let path = dir.join("t.csv");
+        let _ = fs::remove_file(&path);
+        let mut log = CsvLogger::open(&path, 0, 0).unwrap();
+
+        // two simultaneous alerts (overload on 2 pins + disconnect) — the worst alert text
+        let mut r = sample();
+        r.pins[0].amps = 9.5;
+        r.pins[1].amps = 9.6;
+        r.pins[2].amps = 0.0;
+        let alerts = evaluate(&r);
+        assert!(alerts.len() >= 2);
+        log.log("2026-01-01T00:00:00", &r, &alerts).unwrap();
+
+        // an unreachable message containing commas must also stay one field
+        log.log_unreachable(
+            "2026-01-01T00:00:01",
+            "GPU_UNREACHABLE (read failed: foo, bar)",
+        )
+        .unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        for line in text.lines() {
+            assert_eq!(fields(line).len(), 17, "bad column count in: {line}");
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }

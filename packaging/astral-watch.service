@@ -5,7 +5,10 @@ After=multi-user.target
 
 [Service]
 Type=simple
-ExecStartPre=-/usr/sbin/modprobe i2c-dev
+# '+' = run privileged (a plain ExecStartPre runs as the unprivileged User= and modprobe
+# would always fail, masked by '-'); '-' = tolerate failure (i2c-dev may be built in, or
+# already loaded via the shipped modules-load.d snippet)
+ExecStartPre=+-/usr/sbin/modprobe i2c-dev
 ExecStart=/usr/local/bin/astral-watch log /var/log/astral-watch/gpu-pins.csv --interval 0.5
 Restart=always
 RestartSec=5

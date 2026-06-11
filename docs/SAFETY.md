@@ -5,7 +5,7 @@ document explains why that access cannot change device state, and what precautio
 
 ## The access is read-only
 
-For each of the 24 telemetry bytes, the tool issues an **SMBus read-byte-data** transaction:
+For each telemetry byte, the tool issues an **SMBus read-byte-data** transaction:
 
 ```
 S  Addr+W  [A]  Reg(0x80..)  [A]   Sr  Addr+R  [A]  Data  [NA]  P
@@ -15,6 +15,12 @@ It writes exactly **one byte — the register pointer** (`0x80…0x97`) — and 
 *state-changing* i2c/SMBus write requires the host to transmit a **data byte after** the register
 pointer (`… Reg [A] Data [A] P`). `astral-watch` never sends that trailing data byte, so even if a
 register were writable, nothing is written.
+
+Because each 16-bit value spans two transactions, the chip can update it between the high- and
+low-byte reads ("tearing"), which could fabricate a current spike that never happened. Each u16
+is therefore read **high → low → high**, re-reading while the high byte moves. A snapshot is
+typically **36 transactions** (three per 16-bit value, more only while a value is changing) —
+all of them the identical read-only pattern above.
 
 This is identical to what `i2cget … b` does, and to the reads in `sus`, the LACT #906
 proof-of-concept, and LibreHardwareMonitor (`NvAPI_I2CReadEx`). All four independently use the same

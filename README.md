@@ -51,7 +51,9 @@ sudo ./target/release/astral-watch          # live view (run while the GPU is un
 Install system-wide + as an auto-restarting logger service (non-root, via a udev rule):
 
 ```sh
-sudo make install     # binary -> /usr/local/bin, udev rule, systemd unit; prints the enable steps
+sudo make install     # binary, udev rule, systemd unit, sysusers/modules-load snippets;
+                      # creates the service user and reloads udev/systemd — then just:
+sudo systemctl enable --now astral-watch
 ```
 
 ## Usage

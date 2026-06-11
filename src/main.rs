@@ -3,7 +3,7 @@
 use anyhow::{bail, Result};
 use astral_watch::alert::evaluate;
 use astral_watch::cards::{detect_gpu, model_for, ASUS_VENDOR};
-use astral_watch::i2c::{autodetect_bus, nvidia_buses, read_reading};
+use astral_watch::i2c::{autodetect_bus, nvidia_buses, read_reading, CHIP_ADDR_STR};
 use astral_watch::logger::CsvLogger;
 use chrono::Local;
 use clap::{Parser, Subcommand};
@@ -26,7 +26,7 @@ struct Cli {
     bus: Option<u32>,
 
     /// i2c address of the telemetry chip (decimal or 0x-hex)
-    #[arg(long, global = true, default_value = "0x2b", value_parser = parse_u16)]
+    #[arg(long, global = true, default_value = CHIP_ADDR_STR, value_parser = parse_u16)]
     addr: u16,
 
     /// seconds between samples
@@ -54,11 +54,20 @@ enum Cmd {
 
 fn parse_u16(s: &str) -> Result<u16, String> {
     let s = s.trim();
-    match s.strip_prefix("0x") {
+    match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         Some(h) => u16::from_str_radix(h, 16),
         None => s.parse(),
     }
     .map_err(|e| format!("{e}"))
+}
+
+/// Validate `--interval`: `Duration::from_secs_f64` panics on negative/NaN, and 0 would
+/// busy-loop the GPU's i2c bus.
+fn parse_interval(secs: f64) -> Result<Duration> {
+    if !secs.is_finite() || secs <= 0.0 {
+        bail!("--interval must be a positive number of seconds (got {secs})");
+    }
+    Ok(Duration::from_secs_f64(secs))
 }
 
 fn main() -> Result<()> {
@@ -90,7 +99,13 @@ fn main() -> Result<()> {
         cli.addr, cli.interval
     );
 
-    let interval = Duration::from_secs_f64(cli.interval);
+    let interval = parse_interval(cli.interval)?;
+    if cli.interval < 0.05 {
+        eprintln!(
+            "# warning: --interval {} hammers the GPU i2c bus (shared with display traffic)",
+            cli.interval
+        );
+    }
     match cli.cmd.unwrap_or(Cmd::Monitor) {
         Cmd::Monitor => run_monitor(bus, cli.addr, interval),
         Cmd::Log { file, max_mb, keep } => run_log(bus, cli.addr, interval, &file, max_mb, keep),
@@ -119,10 +134,11 @@ fn run_monitor(bus: u32, addr: u16, interval: Duration) -> Result<()> {
                 if !alerts.is_empty() {
                     line.push_str(&format!("  !! {}", join(&alerts)));
                 }
-                print!("{line}    ");
+                print!("{line}\x1b[K");
                 std::io::stdout().flush().ok();
             }
-            _ => eprintln!("\n{ts}  *** GPU unreachable (read failed) ***"),
+            Ok(_) => eprintln!("\n{ts}  *** implausible reading (chip answered; wrong device or GPU resetting?) ***"),
+            Err(e) => eprintln!("\n{ts}  *** read failed: {e:#} ***"),
         }
         sleep(interval);
     }
@@ -136,6 +152,9 @@ fn run_log(
     max_mb: f64,
     keep: u32,
 ) -> Result<()> {
+    if !max_mb.is_finite() || max_mb < 0.0 {
+        bail!("--max-mb must be >= 0 (got {max_mb}); 0 disables rotation");
+    }
     let max_bytes = (max_mb * 1024.0 * 1024.0) as u64;
     let mut log = CsvLogger::open(file, max_bytes, keep)?;
     eprintln!(
@@ -146,22 +165,48 @@ fn run_log(
             String::new()
         }
     );
+    // A failing CSV write must never kill the watchdog or eat an alert: alerts go to
+    // stderr first, write errors degrade to a (de-duplicated) warning and we keep sampling.
+    let mut log_failing = false;
     loop {
         let ts = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-        match read_reading(bus, addr) {
+        let written = match read_reading(bus, addr) {
             Ok(r) if r.plausible() => {
                 let alerts = evaluate(&r);
-                log.log(&ts, &r, &alerts)?;
                 if !alerts.is_empty() {
                     eprintln!("{ts}  ALERT: {}", join(&alerts));
                 }
+                log.log(&ts, &r, &alerts)
             }
-            _ => {
+            Ok(_) => {
+                eprintln!("\n{ts}  *** IMPLAUSIBLE_READING ***");
                 log.log_unreachable(
                     &ts,
-                    "GPU_UNREACHABLE (i2c read failed - GPU may have fallen off the bus)",
-                )?;
+                    "IMPLAUSIBLE_READING (chip answered but data failed sanity checks)",
+                )
+            }
+            Err(e) => {
                 eprintln!("\n{ts}  *** GPU_UNREACHABLE ***");
+                log.log_unreachable(
+                    &ts,
+                    &format!(
+                        "GPU_UNREACHABLE (read failed: {e:#} - GPU may have fallen off the bus)"
+                    ),
+                )
+            }
+        };
+        match written {
+            Ok(()) => {
+                if log_failing {
+                    eprintln!("{ts}  csv logging recovered");
+                    log_failing = false;
+                }
+            }
+            Err(e) => {
+                if !log_failing {
+                    eprintln!("{ts}  csv write failed: {e:#} (alerts still reach stderr; retrying every sample)");
+                    log_failing = true;
+                }
             }
         }
         sleep(interval);
@@ -174,4 +219,27 @@ fn join(alerts: &[astral_watch::alert::Alert]) -> String {
         .map(|a| a.to_string())
         .collect::<Vec<_>>()
         .join(" | ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_u16_accepts_hex_and_decimal() {
+        assert_eq!(parse_u16("0x2b").unwrap(), 0x2b);
+        assert_eq!(parse_u16("0X2B").unwrap(), 0x2b);
+        assert_eq!(parse_u16(" 43 ").unwrap(), 43);
+        assert!(parse_u16("zz").is_err());
+        assert!(parse_u16("0x10000").is_err());
+    }
+
+    #[test]
+    fn interval_rejects_nonpositive_and_nan() {
+        assert!(parse_interval(-1.0).is_err());
+        assert!(parse_interval(0.0).is_err());
+        assert!(parse_interval(f64::NAN).is_err());
+        assert!(parse_interval(f64::INFINITY).is_err());
+        assert_eq!(parse_interval(0.5).unwrap(), Duration::from_millis(500));
+    }
 }

@@ -24,11 +24,21 @@ pub enum Alert {
 impl fmt::Display for Alert {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Alert::Overload(p) => write!(f, "OVERLOAD pins {p:?} >{OVERLOAD_A}A"),
-            Alert::Disconnected(p) => write!(f, "DISCONNECTED? pins {p:?} ~0A under load"),
+            Alert::Overload(p) => write!(f, "OVERLOAD pins {} >{OVERLOAD_A}A", join_pins(p)),
+            Alert::Disconnected(p) => {
+                write!(f, "DISCONNECTED? pins {} ~0A under load", join_pins(p))
+            }
             Alert::Imbalance(r) => write!(f, "IMBALANCE hi/lo={r:.2}"),
         }
     }
+}
+
+/// Pin list as `1+2+5` — kept free of commas so alert text can sit in a CSV field.
+fn join_pins(pins: &[usize]) -> String {
+    pins.iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("+")
 }
 
 /// Evaluate a reading into zero or more alerts.
@@ -109,5 +119,17 @@ mod tests {
     fn idle_noise_not_flagged() {
         // big ratio but tiny absolute load -> ignored
         assert!(evaluate(&reading([0.4, 0.6, 0.5, 0.5, 0.6, 0.7])).is_empty());
+    }
+
+    #[test]
+    fn multi_pin_alert_text_has_no_commas() {
+        // alert text lands in a CSV field; commas would break column alignment
+        let alerts = evaluate(&reading([9.5, 9.6, 0.0, 8.0, 8.0, 8.0]));
+        assert!(alerts.len() >= 2, "expected overload + disconnect");
+        for a in &alerts {
+            let s = a.to_string();
+            assert!(!s.contains(','), "comma in alert text: {s}");
+        }
+        assert!(alerts.iter().any(|a| a.to_string().contains("pins 1+2")));
     }
 }
