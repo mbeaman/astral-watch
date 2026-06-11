@@ -41,7 +41,7 @@ for naming. Don't see yours? [Add it](CONTRIBUTING.md).
 Requires Rust (stable) and `i2c-dev`.
 
 ```sh
-git clone https://github.com/mattbeam/astral-watch
+git clone https://github.com/mbeaman/astral-watch
 cd astral-watch
 cargo build --release
 sudo modprobe i2c-dev

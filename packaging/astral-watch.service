@@ -1,6 +1,6 @@
 [Unit]
 Description=astral-watch — ASUS ROG Astral per-pin 12V-2x6 power monitor
-Documentation=https://github.com/mattbeam/astral-watch
+Documentation=https://github.com/mbeaman/astral-watch
 After=multi-user.target
 
 [Service]
