@@ -1,0 +1,11 @@
+/target
+
+# runtime logs
+*.csv
+*.csv.[0-9]*
+
+# editor / OS
+*.swp
+.idea/
+.vscode/
+.DS_Store

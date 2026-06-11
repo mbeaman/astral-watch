@@ -1,0 +1,31 @@
+[Unit]
+Description=astral-watch — ASUS ROG Astral per-pin 12V-2x6 power monitor
+Documentation=https://github.com/mattbeam/astral-watch
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStartPre=-/usr/sbin/modprobe i2c-dev
+ExecStart=/usr/local/bin/astral-watch log /var/log/astral-watch/gpu-pins.csv --interval 0.5
+Restart=always
+RestartSec=5
+
+# Least privilege: run as the unprivileged 'astral-watch' user, in group 'i2c'
+# (the shipped udev rule grants that group access to the NVIDIA i2c nodes).
+User=astral-watch
+Group=i2c
+LogsDirectory=astral-watch
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_UNIX
+DevicePolicy=closed
+DeviceAllow=char-i2c rw
+
+[Install]
+WantedBy=multi-user.target

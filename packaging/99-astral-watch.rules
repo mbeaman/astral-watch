@@ -1,0 +1,4 @@
+# Grant the 'i2c' group read/write access to NVIDIA GPU i2c buses, so astral-watch can run
+# unprivileged. ATTRS{vendor}=="0x10de" matches the parent PCI device (the NVIDIA GPU), scoping
+# this to GPU i2c adapters only — not motherboard/other i2c buses.
+SUBSYSTEM=="i2c-dev", ATTRS{vendor}=="0x10de", GROUP="i2c", MODE="0660"

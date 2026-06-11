@@ -1,0 +1,29 @@
+[package]
+name = "astral-watch"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "MIT"
+description = "Per-pin 12V-2x6 power monitoring and connector-melt protection for ASUS ROG Astral GPUs on Linux"
+repository = "https://github.com/mattbeam/astral-watch"
+readme = "README.md"
+keywords = ["gpu", "nvidia", "asus", "12vhpwr", "monitoring"]
+categories = ["command-line-utilities"]
+
+[lib]
+name = "astral_watch"
+path = "src/lib.rs"
+
+[[bin]]
+name = "astral-watch"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+i2cdev = "0.6"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[profile.release]
+lto = true
+strip = true
