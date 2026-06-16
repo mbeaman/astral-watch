@@ -51,8 +51,10 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # build + lint the optional feature so it can't rot (tests run in the default job)
+      # build, lint, and run the optional feature's tests (incl. the headless TestBackend
+      # render tests) so it can't rot
       - run: cargo clippy --features tui --all-targets -- -D warnings
+      - run: cargo test --features tui
 
   publish-dry-run:
     name: crates.io packaging
