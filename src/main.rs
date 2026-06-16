@@ -1,12 +1,14 @@
 //! astral-watch CLI: live display, CSV logging, and Prometheus export for ASUS ROG
 //! Astral GPUs — one sampling loop feeding whichever sinks the mode enables.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use astral_watch::alert::evaluate;
 use astral_watch::cards::{detect_gpu, model_for, ASUS_VENDOR};
 use astral_watch::config::{self, Config};
 use astral_watch::exporter;
-use astral_watch::i2c::{detect_bus, read_reading, Detect, CHIP_ADDR_STR};
+use astral_watch::i2c::{
+    bus_pci_id, detect_bus, read_reading, redetect_card, Detect, CHIP_ADDR_STR,
+};
 use astral_watch::lifecycle::{condition_of, Condition, Lifecycle};
 use astral_watch::logger::CsvLogger;
 use astral_watch::metrics::Metrics;
@@ -15,9 +17,18 @@ use chrono::Local;
 use clap::{Parser, Subcommand};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
+
+/// Time the notify queues get to drain on SIGTERM/SIGINT before the process exits — enough
+/// for a small backlog against a slow-but-responsive endpoint, well under systemd's stop
+/// timeout. Workers skip retry backoff while draining (see [`notify::Dispatcher::shutdown`]).
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// Consecutive unusable samples on an auto-detected bus before re-running detection — covers
+/// the GPU resetting and the kernel re-enumerating the i2c bus under a new number.
+const REDETECT_AFTER: u32 = 10;
 
 #[derive(Parser)]
 #[command(
@@ -92,6 +103,14 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let cmd = cli.cmd.unwrap_or(Cmd::Monitor);
 
+    // SIGTERM (systemctl stop) and SIGINT (Ctrl-C) flip this; the loops return promptly and
+    // flush queued notifications instead of being killed mid-delivery
+    let shutdown = Arc::new(AtomicBool::new(false));
+    for sig in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+        signal_hook::flag::register(sig, Arc::clone(&shutdown))
+            .context("registering signal handler")?;
+    }
+
     // config and flag validation first: a typo'd config must fail fast
     let (cfg, cfg_path) = config::load(cli.config.as_deref())?;
     for w in cfg.warnings() {
@@ -161,9 +180,19 @@ fn main() -> Result<()> {
     // The dispatcher and lifecycle exist BEFORE bus detection: a watchdog started during
     // an outage (host reboot after a GPU crash, driver loading late, deeply idle card)
     // must wait and tell someone — not exit into a silent systemd restart loop.
-    let dispatcher = Dispatcher::from_config(&cfg.notify);
+    let mut dispatcher = Dispatcher::from_config(&cfg.notify);
     let mut lifecycle = Lifecycle::new(cfg.alerts);
-    let bus = acquire_bus(cli.bus, cli.addr, &mut lifecycle, &dispatcher, &metrics);
+    let Some(bus) = acquire_bus(
+        cli.bus,
+        cli.addr,
+        &mut lifecycle,
+        &dispatcher,
+        &metrics,
+        &shutdown,
+    ) else {
+        dispatcher.shutdown(SHUTDOWN_GRACE);
+        return Ok(());
+    };
     eprintln!(
         "# i2c-{bus} @ {:#04x}  interval {}s",
         cli.addr, cli.interval
@@ -194,7 +223,34 @@ fn main() -> Result<()> {
         csv,
         metrics,
     };
-    run(bus, cli.addr, interval, &cfg, &dispatcher, lifecycle, sinks)
+    // only re-detect the bus if we picked it; a pinned --bus is the user's explicit choice
+    let auto = cli.bus.is_none();
+    run(
+        bus,
+        cli.addr,
+        interval,
+        &cfg,
+        &dispatcher,
+        lifecycle,
+        sinks,
+        auto,
+        &shutdown,
+    )?;
+    eprintln!("# shutting down — flushing notifications");
+    dispatcher.shutdown(SHUTDOWN_GRACE);
+    Ok(())
+}
+
+/// Sleep up to `dur`, returning early once shutdown is signalled — polled in small steps so
+/// SIGTERM/SIGINT is honored within ~200 ms even with a long `--interval`.
+fn interruptible_sleep(dur: Duration, shutdown: &AtomicBool) {
+    let step = Duration::from_millis(200);
+    let mut left = dur;
+    while !left.is_zero() && !shutdown.load(Ordering::Relaxed) {
+        let nap = left.min(step);
+        sleep(nap);
+        left -= nap;
+    }
 }
 
 /// Detection-retry pause — gentle on the GPU i2c bus, ~15 s to the first notification.
@@ -202,23 +258,28 @@ const ACQUIRE_RETRY: Duration = Duration::from_secs(5);
 
 /// Find the telemetry bus, waiting (and alerting through the lifecycle) instead of
 /// exiting while no GPU answers. A pinned `--bus` is returned as-is; the run loop
-/// handles its read failures the same way.
+/// handles its read failures the same way. Returns `None` if shutdown is signalled
+/// before a bus is found.
 fn acquire_bus(
     pinned: Option<u32>,
     addr: u16,
     lifecycle: &mut Lifecycle,
     dispatcher: &Dispatcher,
     metrics: &Option<Arc<Metrics>>,
-) -> u32 {
+    shutdown: &AtomicBool,
+) -> Option<u32> {
     if let Some(b) = pinned {
-        return b;
+        return Some(b);
     }
     // announce each distinct cause once; it can change between iterations (driver loads,
     // GPU comes under load), so re-announce when it does
     let mut announced: Option<&'static str> = None;
     loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return None;
+        }
         let hint = match detect_bus(addr) {
-            Detect::Found(b) => return b,
+            Detect::Found(b) => return Some(b),
             Detect::NoBuses => {
                 "no NVIDIA i2c buses found — is i2c-dev loaded?  try `sudo modprobe i2c-dev`"
             }
@@ -248,7 +309,7 @@ fn acquire_bus(
             eprintln!("{ts}  {ev}");
             dispatcher.publish(notify::render(&ev, &ts));
         }
-        sleep(ACQUIRE_RETRY);
+        interruptible_sleep(ACQUIRE_RETRY, shutdown);
     }
 }
 
@@ -268,17 +329,27 @@ struct Sinks {
 /// debounced lifecycle events. A failing CSV write must never kill the watchdog: it
 /// degrades to a deduplicated warning, and while the CSV is unwritable the per-sample
 /// record is mirrored to stderr so the forensic trail survives a full disk.
+#[allow(clippy::too_many_arguments)]
 fn run(
-    bus: u32,
+    mut bus: u32,
     addr: u16,
     interval: Duration,
     cfg: &Config,
     dispatcher: &Dispatcher,
     mut lifecycle: Lifecycle,
     mut sinks: Sinks,
+    auto: bool,
+    shutdown: &AtomicBool,
 ) -> Result<()> {
     let mut log_failing = false;
+    let mut misses = 0u32; // consecutive unusable samples, for bus re-detection
+                           // pin re-detection to the card we started on, so a renumber after a GPU reset can't
+                           // migrate the watchdog onto a different Astral (which would falsely resolve the alert)
+    let card = if auto { bus_pci_id(bus) } else { None };
     loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let now = Local::now();
         let ts = now.format("%Y-%m-%dT%H:%M:%S").to_string();
         // the refreshing display line uses the short form; everything durable gets ISO
@@ -289,6 +360,7 @@ fn run(
 
         match read_reading(bus, addr) {
             Ok(r) if r.plausible() => {
+                misses = 0;
                 let alerts = evaluate(&r, &cfg.thresholds);
                 conditions.extend(alerts.iter().map(|a| (condition_of(a), a.to_string())));
                 if let Some(m) = &sinks.metrics {
@@ -320,6 +392,7 @@ fn run(
                 }
             }
             Ok(_) => {
+                misses += 1;
                 // monitor keeps its v0.2.0 wording (interactive diagnosis hint)
                 let msg = if sinks.display {
                     "implausible reading (chip answered; wrong device or GPU resetting?)"
@@ -342,6 +415,7 @@ fn run(
                 }
             }
             Err(e) => {
+                misses += 1;
                 conditions.push((Condition::TelemetryLost, format!("read failed: {e:#}")));
                 if let Some(m) = &sinks.metrics {
                     m.on_read_error();
@@ -390,7 +464,30 @@ fn run(
                 }
             }
         }
-        sleep(interval);
+
+        // Sustained failure on an auto-detected bus may mean the GPU reset and the kernel
+        // renumbered the i2c bus — re-run the same scoped probe to reattach. Throttled to
+        // once per REDETECT_AFTER misses; never for a pinned --bus.
+        if auto && misses >= REDETECT_AFTER {
+            misses = 0;
+            // restrict to the original card's PCI id when we know it; fall back to a plain
+            // probe only if identity was unavailable (single-GPU best effort)
+            let found = match &card {
+                Some(pci) => redetect_card(addr, pci),
+                None => match detect_bus(addr) {
+                    Detect::Found(b) => Some(b),
+                    _ => None,
+                },
+            };
+            if let Some(b2) = found {
+                if b2 != bus {
+                    eprintln!("{ts}  i2c bus changed {bus} -> {b2}, reattached");
+                }
+                bus = b2;
+            }
+        }
+
+        interruptible_sleep(interval, shutdown);
     }
 }
 

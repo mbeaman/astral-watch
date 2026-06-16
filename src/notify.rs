@@ -5,8 +5,10 @@
 //! Within a queue, raise messages are delivered first (a fresh OVERLOAD must not wait
 //! behind stale resolves), each message gets a bounded number of delivery attempts, and
 //! on overflow the oldest non-raise message is dropped. Failures degrade to deduplicated
-//! stderr warnings; they never kill the watchdog. Messages still queued when the process
-//! exits are lost — graceful-shutdown flushing needs signal handling (future arc).
+//! stderr warnings; they never kill the watchdog. On SIGTERM/SIGINT the main loop calls
+//! [`Dispatcher::shutdown`], which makes a best-effort pass at the queued messages within a
+//! deadline (skipping retry backoff) so a final raise/resolve usually still goes out instead
+//! of being dropped on exit; a wedged endpoint is abandoned when the deadline binds.
 
 use crate::config::{NotifyConfig, NtfyConfig, WebhookConfig};
 use crate::lifecycle::{fmt_duration, Condition, Event};
@@ -14,8 +16,8 @@ use anyhow::{bail, Context, Result};
 use std::collections::VecDeque;
 use std::process::Command;
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
-use std::time::Duration;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 /// Most messages a transport queue holds before dropping the oldest non-raise.
 const QUEUE_CAP: usize = 64;
@@ -275,15 +277,17 @@ fn worker(channel: Arc<Channel>, mut transport: Box<dyn Transport>) {
                 st = channel.cvar.wait(st).unwrap();
             }
         };
-        let mut result = Ok(());
-        for attempt in 1..=DELIVERY_ATTEMPTS {
-            result = transport.deliver(&m);
-            if result.is_ok() {
+        let mut result = transport.deliver(&m);
+        let mut attempt = 1;
+        while result.is_err() && attempt < DELIVERY_ATTEMPTS {
+            // while draining on shutdown, don't burn the deadline on retry backoff —
+            // give each queued message one shot and move on
+            if channel.state.lock().unwrap().closed {
                 break;
             }
-            if attempt < DELIVERY_ATTEMPTS {
-                thread::sleep(RETRY_PAUSE);
-            }
+            thread::sleep(RETRY_PAUSE);
+            result = transport.deliver(&m);
+            attempt += 1;
         }
         match result {
             Ok(()) => {
@@ -308,6 +312,7 @@ fn worker(channel: Arc<Channel>, mut transport: Box<dyn Transport>) {
 /// Hands rendered messages to every configured transport, each on its own worker thread.
 pub struct Dispatcher {
     channels: Vec<Arc<Channel>>,
+    workers: Vec<JoinHandle<()>>,
 }
 
 impl Dispatcher {
@@ -329,26 +334,29 @@ impl Dispatcher {
         if cfg.desktop {
             transports.push(Box::new(Desktop));
         }
+        Self::spawn(transports)
+    }
 
-        let channels = transports
-            .into_iter()
-            .map(|t| {
-                let channel = Arc::new(Channel {
-                    state: Mutex::new(ChannelState {
-                        queue: VecDeque::new(),
-                        closed: false,
-                    }),
-                    cvar: Condvar::new(),
-                });
-                let worker_channel = Arc::clone(&channel);
-                thread::Builder::new()
-                    .name(format!("notify-{}", t.name()))
-                    .spawn(move || worker(worker_channel, t))
-                    .expect("spawning notify thread");
-                channel
-            })
-            .collect();
-        Self { channels }
+    fn spawn(transports: Vec<Box<dyn Transport>>) -> Self {
+        let mut channels = Vec::new();
+        let mut workers = Vec::new();
+        for t in transports {
+            let channel = Arc::new(Channel {
+                state: Mutex::new(ChannelState {
+                    queue: VecDeque::new(),
+                    closed: false,
+                }),
+                cvar: Condvar::new(),
+            });
+            let worker_channel = Arc::clone(&channel);
+            let handle = thread::Builder::new()
+                .name(format!("notify-{}", t.name()))
+                .spawn(move || worker(worker_channel, t))
+                .expect("spawning notify thread");
+            channels.push(channel);
+            workers.push(handle);
+        }
+        Self { channels, workers }
     }
 
     /// Queue a message for delivery on every transport. Never blocks the sampling loop.
@@ -359,14 +367,41 @@ impl Dispatcher {
             channel.cvar.notify_one();
         }
     }
-}
 
-impl Drop for Dispatcher {
-    fn drop(&mut self) {
+    /// Close the queues and let the workers make a best-effort drain of what's already
+    /// queued, up to `timeout`. Called on SIGTERM/SIGINT so a final raise/resolve usually
+    /// still goes out instead of being dropped on exit; workers skip retry backoff while
+    /// closed. A wedged transport can't stall shutdown past the deadline — any still-running
+    /// worker is left to die with the process.
+    pub fn shutdown(&mut self, timeout: Duration) {
+        self.close();
+        let deadline = Instant::now() + timeout;
+        for handle in self.workers.drain(..) {
+            loop {
+                if handle.is_finished() {
+                    let _ = handle.join();
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    break; // leave it; process exit reaps it
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    fn close(&self) {
         for channel in &self.channels {
             channel.state.lock().unwrap().closed = true;
             channel.cvar.notify_one();
         }
+    }
+}
+
+impl Drop for Dispatcher {
+    fn drop(&mut self) {
+        // best-effort if shutdown() wasn't called: tell workers to stop (no wait)
+        self.close();
     }
 }
 
@@ -390,6 +425,73 @@ mod tests {
             .proxy(None)
             .build()
             .into()
+    }
+
+    /// Records delivered message titles; optionally blocks each delivery to simulate a slow
+    /// transport that must not stall shutdown past the deadline.
+    struct Recorder {
+        seen: Arc<Mutex<Vec<String>>>,
+        per_delivery: Duration,
+    }
+
+    impl Transport for Recorder {
+        fn name(&self) -> &'static str {
+            "recorder"
+        }
+        fn deliver(&mut self, m: &Message) -> Result<()> {
+            if !self.per_delivery.is_zero() {
+                thread::sleep(self.per_delivery);
+            }
+            self.seen.lock().unwrap().push(m.title.clone());
+            Ok(())
+        }
+    }
+
+    fn rendered(title: &str) -> Message {
+        Message {
+            kind: "raised",
+            condition: "overload",
+            title: title.to_string(),
+            body: String::new(),
+            priority: Priority::Urgent,
+            ts: String::new(),
+        }
+    }
+
+    #[test]
+    fn shutdown_drains_queued_messages() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        // nonzero per-delivery so the queue is still draining when shutdown() is called —
+        // exercises the close-then-drain-within-deadline path, not an already-idle worker
+        let mut d = Dispatcher::spawn(vec![Box::new(Recorder {
+            seen: Arc::clone(&seen),
+            per_delivery: Duration::from_millis(40),
+        })]);
+        for i in 0..5 {
+            d.publish(rendered(&format!("m{i}")));
+        }
+        d.shutdown(Duration::from_secs(5)); // 5 x 40ms drain << deadline
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            5,
+            "all queued messages delivered before exit"
+        );
+    }
+
+    #[test]
+    fn shutdown_respects_deadline_with_a_wedged_transport() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut d = Dispatcher::spawn(vec![Box::new(Recorder {
+            seen: Arc::clone(&seen),
+            per_delivery: Duration::from_secs(30), // far longer than the deadline
+        })]);
+        d.publish(rendered("slow"));
+        let start = Instant::now();
+        d.shutdown(Duration::from_millis(200));
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "shutdown must not block on a wedged transport"
+        );
     }
 
     #[test]

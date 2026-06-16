@@ -30,7 +30,9 @@ Linux with no side effects.
 ## Precautions taken
 
 - **No bus scanning.** The tool only ever addresses the single known chip address (`0x2B`); it never
-  runs an `i2cdetect`-style probe, which can disturb other devices on the GPU's i2c bus.
+  runs an `i2cdetect`-style probe, which can disturb other devices on the GPU's i2c bus. Bus
+  *re-detection* after a sustained read failure (e.g. the GPU reset and the kernel renumbered the
+  adapters) reuses this same scoped probe — `0x2B` on NVIDIA-named adapters only — never a scan.
 - **Targeted bus.** It only touches i2c adapters whose sysfs `name` identifies them as NVIDIA.
 - **Plausibility gating.** A response is only trusted if it decodes to a sane rail voltage (~12 V);
   otherwise it's reported as "not the chip / unsupported SKU" rather than shown as data.

@@ -179,6 +179,42 @@ pub fn detect_bus(addr: u16) -> Detect {
     }
 }
 
+/// PCI address (e.g. `0000:0b:00.0`) of the GPU an i2c bus belongs to, from its resolved
+/// sysfs path. Every i2c adapter of one card shares this, so it's a stable per-card identity
+/// that survives the kernel renumbering the adapters after a GPU reset.
+pub fn bus_pci_id(bus: u32) -> Option<String> {
+    let real = fs::canonicalize(format!("/sys/class/i2c-dev/i2c-{bus}")).ok()?;
+    pci_id_from_path(&real.to_string_lossy())
+}
+
+/// Deepest PCI BDF component of a sysfs path — the GPU function itself, not a parent bridge.
+fn pci_id_from_path(path: &str) -> Option<String> {
+    path.split('/')
+        .rev()
+        .find(|c| is_pci_bdf(c))
+        .map(str::to_string)
+}
+
+/// Matches a PCI `domain:bus:device.function` slot, e.g. `0000:0b:00.0` (rejects `pci0000:00`).
+fn is_pci_bdf(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 12
+        && b[4] == b':'
+        && b[7] == b':'
+        && b[10] == b'.'
+        && s.char_indices()
+            .all(|(i, c)| matches!(i, 4 | 7 | 10) || c.is_ascii_hexdigit())
+}
+
+/// Re-detect for a known card: the first plausible bus whose GPU PCI id matches `want_pci`.
+/// Unlike [`detect_bus`], this never migrates to a *different* GPU after a renumber, so on a
+/// multi-Astral box a crashed card is never silently swapped for a healthy sibling.
+pub fn redetect_card(addr: u16, want_pci: &str) -> Option<u32> {
+    nvidia_buses().into_iter().find(|&b| {
+        bus_pci_id(b).as_deref() == Some(want_pci) && matches!(probe_bus(b, addr), Probe::Plausible)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +283,26 @@ mod tests {
     fn chip_addr_str_matches_const() {
         let parsed = u16::from_str_radix(CHIP_ADDR_STR.trim_start_matches("0x"), 16).unwrap();
         assert_eq!(parsed, CHIP_ADDR);
+    }
+
+    #[test]
+    fn pci_id_extracted_from_sysfs_path() {
+        // real shape: /sys/class/i2c-dev/i2c-0 resolves through the GPU's PCI function
+        assert_eq!(
+            pci_id_from_path(
+                "/sys/devices/pci0000:00/0000:00:03.1/0000:0b:00.0/i2c-0/i2c-dev/i2c-0"
+            ),
+            Some("0000:0b:00.0".to_string()),
+            "must pick the deepest BDF (the GPU), not the bridge or the pci0000:00 root"
+        );
+        assert_eq!(
+            pci_id_from_path("/sys/devices/platform/whatever/i2c-9"),
+            None
+        );
+        assert!(is_pci_bdf("0000:0b:00.0"));
+        assert!(!is_pci_bdf("pci0000:00"));
+        assert!(!is_pci_bdf("0000:0b:00.")); // wrong length
+        assert!(!is_pci_bdf("zzzz:0b:00.0")); // non-hex
     }
 
     #[test]

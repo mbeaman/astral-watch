@@ -5,6 +5,20 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Graceful shutdown** — on SIGTERM (`systemctl stop`) or SIGINT (Ctrl-C) the watchdog
+  flushes queued notifications (best-effort, within a short deadline) instead of dropping a
+  final raise/resolve, and exits promptly even while waiting for a GPU.
+- **Bus re-detection** — after sustained read failures on an auto-detected bus (e.g. a GPU
+  reset renumbered the i2c adapters), the same scoped probe re-attaches. It is pinned to the
+  originating card's PCI id, so on a multi-Astral box the watchdog never silently migrates to
+  a different card (which would falsely resolve the crashed card's alert).
+
+### Changed
+- CI `actions/checkout` bumped to v5 (off the deprecated Node 20 runtime).
+
 ## [0.3.1] - 2026-06-15
 
 ### Fixed
@@ -84,6 +98,7 @@ Initial release: per-pin 12V-2x6 telemetry (ITE IT8915FN over `/dev/i2c-*`), liv
 auto-rotating CSV logging with falloff capture, overload/disconnect/imbalance alerts,
 hardened systemd service + udev rule, read-only safety design (`docs/SAFETY.md`).
 
+[Unreleased]: https://github.com/mbeaman/astral-watch/compare/v0.3.1...HEAD
 [0.3.1]: https://github.com/mbeaman/astral-watch/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/mbeaman/astral-watch/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/mbeaman/astral-watch/compare/v0.1.1...v0.2.0
