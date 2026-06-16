@@ -297,3 +297,83 @@ fn stat_lines(app: &App) -> Vec<Line<'static>> {
     }
     lines
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decode::Pin;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn app_with(amps: [f64; 6]) -> App {
+        App {
+            bus: 7,
+            addr: 0x2b,
+            card: None,
+            label: "0000:0b:00.0".into(),
+            reading: Some(Reading {
+                pins: amps.map(|a| Pin {
+                    volts: 12.0,
+                    amps: a,
+                }),
+            }),
+            live: true,
+            active: Vec::new(),
+            watts: VecDeque::from(vec![100, 200, 300, 250]),
+            status: "ok".into(),
+            misses: 0,
+            samples: 5,
+            metrics: None,
+        }
+    }
+
+    /// Render the dashboard to an in-memory backend (no TTY) and flatten the cells to text.
+    fn screen(app: &App, w: u16, h: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        term.backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn renders_header_pins_and_totals() {
+        let s = screen(&app_with([8.2, 8.6, 8.3, 8.4, 8.5, 8.8]), 80, 24);
+        assert!(s.contains("astral-watch"), "{s}");
+        assert!(s.contains("0000:0b:00.0"), "card id in header");
+        assert!(s.contains("p1") && s.contains("p6"), "per-pin bar labels");
+        assert!(s.contains("total") && s.contains("balance"), "stats line");
+        assert!(s.contains("alerts: none"), "healthy = no alerts");
+    }
+
+    #[test]
+    fn renders_active_overload_alert() {
+        let mut app = app_with([9.5, 8.0, 8.0, 8.0, 8.0, 8.0]);
+        app.active = vec![Condition::Overload];
+        let s = screen(&app, 80, 24);
+        assert!(s.contains("ALERTS") && s.contains("OVERLOAD"), "{s}");
+    }
+
+    #[test]
+    fn marks_data_stale_during_an_outage() {
+        let mut app = app_with([8.0; 6]);
+        app.live = false; // last read failed; totals are last-known
+        let s = screen(&app, 80, 24);
+        assert!(
+            s.contains("STALE"),
+            "stale totals must be flagged, not shown as healthy"
+        );
+    }
+
+    #[test]
+    fn tiny_or_degenerate_terminal_does_not_panic() {
+        // the layout has two Min() rows; ratatui must shrink, not panic, on a small area
+        let app = app_with([8.0; 6]);
+        for (w, h) in [(20, 6), (1, 1), (200, 80)] {
+            let _ = screen(&app, w, h);
+        }
+    }
+}
