@@ -71,8 +71,13 @@ jobs:
       - name: Validate systemd unit
         run: |
           sudo install -Dm755 stage/usr/bin/astral-watch /usr/bin/astral-watch
-          sudo systemd-sysusers stage/usr/lib/sysusers.d/astral-watch.conf
-          sudo systemd-analyze verify stage/usr/lib/systemd/system/astral-watch.service
+          # systemd-sysusers needs an absolute config path (a positional arg is not opened
+          # relative to the CWD); $PWD expands before sudo runs
+          sudo systemd-sysusers "$PWD/stage/usr/lib/sysusers.d/astral-watch.conf"
+          # confirm the snippet actually created the account the unit's User=/Group= need
+          getent group i2c
+          getent passwd astral-watch
+          sudo systemd-analyze verify "$PWD/stage/usr/lib/systemd/system/astral-watch.service"
       - name: Validate udev rule
         run: sudo udevadm verify --resolve-names=never packaging/99-astral-watch.rules
 
