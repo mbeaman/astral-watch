@@ -42,30 +42,61 @@ for naming. Don't see yours? [Add it](CONTRIBUTING.md).
 | `8A2E` | ROG Astral RTX 5090 (variant) |
 | `89EC` | ROG Astral RTX 5080 |
 
-## Install
+## Setup
 
-Prebuilt Linux binaries (gnu + static musl) ship on the
-[releases page](https://github.com/mbeaman/astral-watch/releases); an AUR `PKGBUILD` lives in
-[`packaging/aur/`](packaging/aur/). Note that a bare binary (prebuilt, or via
-`cargo install`) is just the binary — the udev rule and systemd service come from
-`make install` or the AUR package.
+Two things gate access, and the tool tells you which is missing if you skip one:
 
-Building from source requires Rust (1.85+) and `i2c-dev`.
+- **i2c bus access.** Readings come from `/dev/i2c-*`, which is root-owned and group-readable
+  (the shipped udev rule puts the NVIDIA adapters in the **`i2c` group**, mode `0660`). So
+  `astral-watch` must run **as root (`sudo`)** or **as a user in the `i2c` group** — otherwise
+  it reports `permission denied opening /dev/i2c-*`.
+- **A GPU under load.** The chip only answers with plausible telemetry while the card is
+  drawing power; on a deeply idle GPU autodetect finds nothing. Run a game or benchmark.
+
+You also need the `i2c-dev` kernel module (`sudo modprobe i2c-dev`; the service loads it for
+you). Building from source needs Rust 1.85+.
+
+### Quick try
+
+Grab a prebuilt binary (gnu + static musl) from the
+[releases page](https://github.com/mbeaman/astral-watch/releases), or build from source:
 
 ```sh
 git clone https://github.com/mbeaman/astral-watch
 cd astral-watch
 cargo build --release
 sudo modprobe i2c-dev
-sudo ./target/release/astral-watch          # live view (run while the GPU is under load)
+sudo ./target/release/astral-watch          # live per-pin view, under load
 ```
 
-Install system-wide + as an auto-restarting logger service (non-root, via a udev rule):
+A bare binary (a prebuilt download, or `cargo install astral-watch`) is *only* the binary —
+`sudo` runs it, but the udev rule, the unprivileged service, and the `i2c` group come from the
+full install below.
+
+### Install the service (recommended)
+
+The way to run it continuously: an auto-restarting logger that survives reboots and runs
+**unprivileged** — as a dedicated `astral-watch` user in the `i2c` group, granted bus access by
+the shipped udev rule.
 
 ```sh
-sudo make install     # binary, udev rule, systemd unit, sysusers/modules-load snippets;
-                      # creates the service user and reloads udev/systemd — then just:
+sudo make install     # binary -> /usr/local/bin; udev rule; systemd unit; sysusers +
+                      # modules-load snippets. Creates the i2c group and service user,
+                      # loads i2c-dev, reloads udev/systemd.
 sudo systemctl enable --now astral-watch
+```
+
+It logs to `/var/log/astral-watch/gpu-pins.csv` and reads `/etc/astral-watch.toml` (a commented
+example is installed there — see [Configuration](#configuration)). On Arch, use the
+[AUR `PKGBUILD`](packaging/aur/) instead of `make install`.
+
+### Run it yourself without sudo
+
+`make install` creates the `i2c` group; add your user to it and re-login:
+
+```sh
+sudo usermod -aG i2c "$USER"     # then log out and back in
+astral-watch                     # no sudo needed; the service keeps logging in the background
 ```
 
 ## Usage

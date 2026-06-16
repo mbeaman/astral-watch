@@ -11,8 +11,9 @@
 use crate::decode::{decode, Reading, RAW_LEN};
 use anyhow::{Context, Result};
 use i2cdev::core::I2CDevice;
-use i2cdev::linux::LinuxI2CDevice;
+use i2cdev::linux::{LinuxI2CDevice, LinuxI2CError};
 use std::fs;
+use std::io::ErrorKind;
 
 /// i2c slave address of the ASUS power-telemetry MCU.
 pub const CHIP_ADDR: u16 = 0x2b;
@@ -90,11 +91,29 @@ pub fn read_raw_from(dev: &mut impl RegReader) -> Result<[u8; RAW_LEN]> {
     Ok(buf)
 }
 
+fn device_path(bus: u32) -> String {
+    format!("/dev/i2c-{bus}")
+}
+
+/// Open the i2c device, returning the typed error so callers can classify it.
+fn open(bus: u32, addr: u16) -> std::result::Result<LinuxI2CDevice, LinuxI2CError> {
+    LinuxI2CDevice::new(device_path(bus), addr)
+}
+
+/// Whether opening/talking to the bus was denied — the process lacks i2c access (not in the
+/// `i2c` group, and not root). The denial almost always surfaces at `open()` as an
+/// `io::Error`; the `Errno` arm covers a denial raised later by an ioctl.
+fn is_permission_denied(err: &LinuxI2CError) -> bool {
+    match err {
+        LinuxI2CError::Io(e) => e.kind() == ErrorKind::PermissionDenied,
+        LinuxI2CError::Errno(n) => *n == 13 || *n == 1, // EACCES, EPERM
+    }
+}
+
 /// Read the 24-byte telemetry block from `addr` on `bus`, register by register.
 pub fn read_raw(bus: u32, addr: u16) -> Result<[u8; RAW_LEN]> {
-    let path = format!("/dev/i2c-{bus}");
-    let mut dev = LinuxI2CDevice::new(&path, addr)
-        .with_context(|| format!("opening {path} @ {addr:#04x}"))?;
+    let path = device_path(bus);
+    let mut dev = open(bus, addr).with_context(|| format!("opening {path} @ {addr:#04x}"))?;
     read_raw_from(&mut dev).with_context(|| format!("reading {path} @ {addr:#04x}"))
 }
 
@@ -103,13 +122,61 @@ pub fn read_reading(bus: u32, addr: u16) -> Result<Reading> {
     Ok(decode(&read_raw(bus, addr)?))
 }
 
-/// First NVIDIA bus that returns plausible telemetry at `addr`, if any.
-pub fn autodetect_bus(addr: u16) -> Option<u32> {
-    nvidia_buses().into_iter().find(|&b| {
-        read_reading(b, addr)
-            .map(|r| r.plausible())
-            .unwrap_or(false)
-    })
+/// What scanning the NVIDIA buses for the telemetry chip turned up. Distinguishing these lets
+/// the caller give an actionable message instead of always blaming an idle GPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Detect {
+    /// A bus answered with plausible telemetry.
+    Found(u32),
+    /// No NVIDIA i2c buses exist — the `i2c-dev` module probably isn't loaded.
+    NoBuses,
+    /// Buses exist but opening them was denied: the process lacks i2c access.
+    PermissionDenied,
+    /// Buses exist and were readable, but none returned plausible telemetry — the GPU is
+    /// genuinely idle, the address is wrong, or the SKU is unsupported.
+    NoTelemetry,
+}
+
+enum Probe {
+    Plausible,
+    PermissionDenied,
+    Other,
+}
+
+fn probe_bus(bus: u32, addr: u16) -> Probe {
+    let mut dev = match open(bus, addr) {
+        Ok(d) => d,
+        Err(e) if is_permission_denied(&e) => return Probe::PermissionDenied,
+        Err(_) => return Probe::Other,
+    };
+    match read_raw_from(&mut dev) {
+        Ok(raw) if decode(&raw).plausible() => Probe::Plausible,
+        _ => Probe::Other,
+    }
+}
+
+/// Scan the NVIDIA buses for the chip, reporting *why* if none answered so a "deeply idle"
+/// message is never shown when the real problem is missing i2c permissions.
+pub fn detect_bus(addr: u16) -> Detect {
+    let buses = nvidia_buses();
+    if buses.is_empty() {
+        return Detect::NoBuses;
+    }
+    // a denied open is the most actionable cause; all NVIDIA i2c nodes share permissions,
+    // so in practice it's all-or-nothing, but prefer it over NoTelemetry if mixed
+    let mut denied = false;
+    for b in buses {
+        match probe_bus(b, addr) {
+            Probe::Plausible => return Detect::Found(b),
+            Probe::PermissionDenied => denied = true,
+            Probe::Other => {}
+        }
+    }
+    if denied {
+        Detect::PermissionDenied
+    } else {
+        Detect::NoTelemetry
+    }
 }
 
 #[cfg(test)]
@@ -180,5 +247,24 @@ mod tests {
     fn chip_addr_str_matches_const() {
         let parsed = u16::from_str_radix(CHIP_ADDR_STR.trim_start_matches("0x"), 16).unwrap();
         assert_eq!(parsed, CHIP_ADDR);
+    }
+
+    #[test]
+    fn permission_denied_is_classified_distinctly() {
+        // the open-time denial (io::Error) — the real path when not in the i2c group
+        let io_denied = LinuxI2CError::Io(ErrorKind::PermissionDenied.into());
+        assert!(is_permission_denied(&io_denied));
+        // and an ioctl-time denial via errno (EACCES / EPERM)
+        assert!(is_permission_denied(&LinuxI2CError::Errno(13)));
+        assert!(is_permission_denied(&LinuxI2CError::Errno(1)));
+
+        // a genuinely idle/absent chip is NOT a permission problem
+        assert!(!is_permission_denied(&LinuxI2CError::Io(
+            ErrorKind::NotFound.into()
+        )));
+        assert!(!is_permission_denied(&LinuxI2CError::Io(
+            ErrorKind::TimedOut.into()
+        )));
+        assert!(!is_permission_denied(&LinuxI2CError::Errno(6))); // ENXIO
     }
 }

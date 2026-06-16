@@ -5,6 +5,19 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-06-15
+
+### Fixed
+- Bus autodetection no longer blames an idle GPU for a permission error. Opening `/dev/i2c-*`
+  without i2c access (not in the `i2c` group, not root) now reports `permission denied` with
+  how to fix it, instead of the misleading "GPU deeply idle? run under load" — which showed
+  even with the card at full load. `autodetect_bus` became `detect_bus -> Detect` so the cause
+  (no buses / permission denied / no telemetry) is distinguished and surfaced.
+
+### Changed
+- README `Setup` section rewritten to define the access model (i2c group / sudo) and the GPU
+  load requirement up front, with quick-try, service-install, and run-without-sudo paths.
+
 ## [0.3.0] - 2026-06-11
 
 ### Added
@@ -71,6 +84,7 @@ Initial release: per-pin 12V-2x6 telemetry (ITE IT8915FN over `/dev/i2c-*`), liv
 auto-rotating CSV logging with falloff capture, overload/disconnect/imbalance alerts,
 hardened systemd service + udev rule, read-only safety design (`docs/SAFETY.md`).
 
+[0.3.1]: https://github.com/mbeaman/astral-watch/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/mbeaman/astral-watch/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/mbeaman/astral-watch/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/mbeaman/astral-watch/compare/v0.1.0...v0.1.1

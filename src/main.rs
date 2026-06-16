@@ -6,7 +6,7 @@ use astral_watch::alert::evaluate;
 use astral_watch::cards::{detect_gpu, model_for, ASUS_VENDOR};
 use astral_watch::config::{self, Config};
 use astral_watch::exporter;
-use astral_watch::i2c::{autodetect_bus, nvidia_buses, read_reading, CHIP_ADDR_STR};
+use astral_watch::i2c::{detect_bus, read_reading, Detect, CHIP_ADDR_STR};
 use astral_watch::lifecycle::{condition_of, Condition, Lifecycle};
 use astral_watch::logger::CsvLogger;
 use astral_watch::metrics::Metrics;
@@ -213,22 +213,33 @@ fn acquire_bus(
     if let Some(b) = pinned {
         return b;
     }
-    let mut quiet = false;
+    // announce each distinct cause once; it can change between iterations (driver loads,
+    // GPU comes under load), so re-announce when it does
+    let mut announced: Option<&'static str> = None;
     loop {
-        if nvidia_buses().is_empty() {
-            if !quiet {
-                eprintln!("# no NVIDIA i2c buses found — is i2c-dev loaded?  `sudo modprobe i2c-dev`  (will keep checking)");
+        let hint = match detect_bus(addr) {
+            Detect::Found(b) => return b,
+            Detect::NoBuses => {
+                "no NVIDIA i2c buses found — is i2c-dev loaded?  try `sudo modprobe i2c-dev`"
             }
-        } else if let Some(b) = autodetect_bus(addr) {
-            return b;
-        } else if !quiet {
-            eprintln!("# no per-pin telemetry on any NVIDIA bus yet (GPU deeply idle? run under load, or pass --bus N)  (will keep checking)");
+            Detect::PermissionDenied => {
+                "permission denied opening /dev/i2c-* — run with sudo, or `sudo make install` \
+                 (creates the `i2c` group + udev rule); after that, add your user to the `i2c` \
+                 group and re-login to run without sudo"
+            }
+            Detect::NoTelemetry => {
+                "no per-pin telemetry on any NVIDIA bus yet — GPU deeply idle? run under load, \
+                 or pass --bus N"
+            }
+        };
+        if announced != Some(hint) {
+            eprintln!("# {hint}  (will keep checking)");
+            announced = Some(hint);
         }
-        quiet = true;
         let ts = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
         let waiting = (
             Condition::TelemetryLost,
-            "waiting for GPU telemetry (no readable bus)".to_string(),
+            format!("waiting for GPU telemetry: {hint}"),
         );
         for ev in lifecycle.observe(Instant::now(), std::slice::from_ref(&waiting)) {
             if let Some(m) = metrics {
