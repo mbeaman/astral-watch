@@ -8,6 +8,10 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 ## [Unreleased]
 
 ### Added
+- **GPU identity correlation** — the startup banner now lists every NVIDIA GPU (VGA *and*
+  3D-controller class, so a second card isn't missed) and, after detection, names the card
+  actually backing the monitored i2c bus (`# monitoring <pci> (<model>)`) instead of guessing
+  the first VGA. On a multi-GPU box it notes that only one card is watched.
 - **Graceful shutdown** — on SIGTERM (`systemctl stop`) or SIGINT (Ctrl-C) the watchdog
   flushes queued notifications (best-effort, within a short deadline) instead of dropping a
   final raise/resolve, and exits promptly even while waiting for a GPU.

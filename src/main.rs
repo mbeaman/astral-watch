@@ -3,7 +3,7 @@
 
 use anyhow::{bail, Context, Result};
 use astral_watch::alert::evaluate;
-use astral_watch::cards::{detect_gpu, model_for, ASUS_VENDOR};
+use astral_watch::cards::{gpu_at, nvidia_gpus};
 use astral_watch::config::{self, Config};
 use astral_watch::exporter;
 use astral_watch::i2c::{
@@ -124,13 +124,20 @@ fn main() -> Result<()> {
         );
     }
 
-    if let Some((pci, sv, sd)) = detect_gpu() {
-        let model =
-            model_for(sd).unwrap_or("unknown — not in card DB (still works if the chip answers)");
-        eprintln!("# GPU {pci}  subsystem {sv:04x}:{sd:04x}  -> {model}");
-        if sv != ASUS_VENDOR {
-            eprintln!("# note: subsystem vendor isn't ASUS; per-pin telemetry is an ASUS ROG Astral/Matrix feature");
-        }
+    let gpus = nvidia_gpus();
+    for g in &gpus {
+        let model = g
+            .model()
+            .unwrap_or("unknown — not in card DB (still works if the chip answers)");
+        eprintln!(
+            "# GPU {}  subsystem {:04x}:{:04x}  -> {model}",
+            g.pci, g.subsystem_vendor, g.subsystem_device
+        );
+    }
+    if !gpus.is_empty() && !gpus.iter().any(|g| g.is_asus()) {
+        eprintln!(
+            "# note: no ASUS GPU here; per-pin telemetry is an ASUS ROG Astral/Matrix feature"
+        );
     }
 
     eprintln!(
@@ -197,6 +204,20 @@ fn main() -> Result<()> {
         "# i2c-{bus} @ {:#04x}  interval {}s",
         cli.addr, cli.interval
     );
+    // name the card actually backing this bus (not just the first VGA), and flag the
+    // multi-GPU case where only one of several cards is being watched
+    if let Some(pci) = bus_pci_id(bus) {
+        let model = gpu_at(&pci)
+            .and_then(|g| g.model())
+            .unwrap_or("unknown SKU");
+        eprintln!("# monitoring {pci} ({model})");
+        if gpus.len() > 1 {
+            eprintln!(
+                "# note: {} NVIDIA GPUs present — only {pci} is monitored; pass --bus N to pick another",
+                gpus.len()
+            );
+        }
+    }
 
     let csv = match &cmd {
         Cmd::Log { file, max_mb, keep } => {
