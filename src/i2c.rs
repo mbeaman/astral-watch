@@ -206,6 +206,10 @@ fn is_pci_bdf(s: &str) -> bool {
             .all(|(i, c)| matches!(i, 4 | 7 | 10) || c.is_ascii_hexdigit())
 }
 
+/// Consecutive unusable samples on an auto-detected bus before re-running detection — covers
+/// the GPU resetting and the kernel re-enumerating the i2c bus under a new number.
+pub const REDETECT_AFTER: u32 = 10;
+
 /// Re-detect for a known card: the first plausible bus whose GPU PCI id matches `want_pci`.
 /// Unlike [`detect_bus`], this never migrates to a *different* GPU after a renumber, so on a
 /// multi-Astral box a crashed card is never silently swapped for a healthy sibling.

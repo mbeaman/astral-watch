@@ -8,6 +8,11 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 ## [Unreleased]
 
 ### Added
+- **Live TUI dashboard** (opt-in `tui` build feature) — a full-screen view: per-pin current
+  bar chart (red over 9.2 A), totals/balance, debounced alert state, and a watts sparkline.
+  `cargo install astral-watch --features tui`, then `astral-watch tui`. It reuses the shared
+  reader, alert lifecycle, card-pinned re-detection, and metrics cache; the **default build
+  stays dependency-light** (no ratatui, MSRV 1.85) — the feature raises the build to 1.88.
 - **GPU identity correlation** — the startup banner now lists every NVIDIA GPU (VGA *and*
   3D-controller class, so a second card isn't missed) and, after detection, names the card
   actually backing the monitored i2c bus (`# monitoring <pci> (<model>)`) instead of guessing

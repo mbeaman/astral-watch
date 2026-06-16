@@ -7,7 +7,7 @@ use astral_watch::cards::{gpu_at, nvidia_gpus};
 use astral_watch::config::{self, Config};
 use astral_watch::exporter;
 use astral_watch::i2c::{
-    bus_pci_id, detect_bus, read_reading, redetect_card, Detect, CHIP_ADDR_STR,
+    bus_pci_id, detect_bus, read_reading, redetect_card, Detect, CHIP_ADDR_STR, REDETECT_AFTER,
 };
 use astral_watch::lifecycle::{condition_of, Condition, Lifecycle};
 use astral_watch::logger::CsvLogger;
@@ -26,9 +26,6 @@ use std::time::{Duration, Instant};
 /// for a small backlog against a slow-but-responsive endpoint, well under systemd's stop
 /// timeout. Workers skip retry backoff while draining (see [`notify::Dispatcher::shutdown`]).
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
-/// Consecutive unusable samples on an auto-detected bus before re-running detection — covers
-/// the GPU resetting and the kernel re-enumerating the i2c bus under a new number.
-const REDETECT_AFTER: u32 = 10;
 
 #[derive(Parser)]
 #[command(
@@ -79,6 +76,9 @@ enum Cmd {
         #[arg(long)]
         listen: Option<String>,
     },
+    /// Full-screen live dashboard (built with `--features tui`)
+    #[cfg(feature = "tui")]
+    Tui,
 }
 
 fn parse_u16(s: &str) -> Result<u16, String> {
@@ -219,6 +219,19 @@ fn main() -> Result<()> {
         }
     }
 
+    // only re-detect the bus if we picked it; a pinned --bus is the user's explicit choice
+    let auto = cli.bus.is_none();
+
+    // the TUI is its own foreground render loop; it feeds the metrics cache (so a configured
+    // exporter still serves live data) but not CSV, and flushes notifications on the way out
+    #[cfg(feature = "tui")]
+    if matches!(cmd, Cmd::Tui) {
+        let r =
+            astral_watch::tui::run_tui(bus, cli.addr, interval, &cfg, auto, &metrics, &shutdown);
+        dispatcher.shutdown(SHUTDOWN_GRACE);
+        return r;
+    }
+
     let csv = match &cmd {
         Cmd::Log { file, max_mb, keep } => {
             if !max_mb.is_finite() || *max_mb < 0.0 {
@@ -244,8 +257,6 @@ fn main() -> Result<()> {
         csv,
         metrics,
     };
-    // only re-detect the bus if we picked it; a pinned --bus is the user's explicit choice
-    let auto = cli.bus.is_none();
     run(
         bus,
         cli.addr,

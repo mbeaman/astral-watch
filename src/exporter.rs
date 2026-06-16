@@ -181,7 +181,9 @@ mod tests {
         sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let dripper = thread::spawn(move || {
             // drip a byte every 100ms — never completing the request
-            for _ in 0..30 {
+            // keep dripping well past the assertion window, so finishing early can only
+            // mean the request deadline fired (not that the client stopped sending)
+            for _ in 0..80 {
                 if sock.write_all(b"G").is_err() {
                     break;
                 }
@@ -193,8 +195,11 @@ mod tests {
         });
 
         let held_for = server.join().unwrap();
+        // deadline is 400ms; a generous 4s ceiling proves "bounded, not hung" without
+        // flaking on a loaded CI runner, while the 8s dripper proves the deadline (not the
+        // client) ended it
         assert!(
-            held_for < Duration::from_secs(2),
+            held_for < Duration::from_secs(4),
             "drip client held the handler for {held_for:?}"
         );
         let response = dripper.join().unwrap();

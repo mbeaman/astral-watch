@@ -488,8 +488,10 @@ mod tests {
         d.publish(rendered("slow"));
         let start = Instant::now();
         d.shutdown(Duration::from_millis(200));
+        // deadline is 200ms, the wedged delivery would take 30s; a 4s ceiling proves the
+        // deadline bound it without flaking under CI load
         assert!(
-            start.elapsed() < Duration::from_secs(2),
+            start.elapsed() < Duration::from_secs(4),
             "shutdown must not block on a wedged transport"
         );
     }

@@ -16,3 +16,5 @@ pub mod lifecycle;
 pub mod logger;
 pub mod metrics;
 pub mod notify;
+#[cfg(feature = "tui")]
+pub mod tui;

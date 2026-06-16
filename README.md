@@ -109,6 +109,15 @@ astral-watch export                # serve Prometheus metrics on 127.0.0.1:9942
 astral-watch --bus 0 --addr 0x2b   # pin the bus/address manually
 ```
 
+A full-screen live dashboard (per-pin bars, totals, alert state, a watts sparkline) is an
+opt-in build feature — it pulls in `ratatui` and raises the build's Rust requirement to 1.88,
+so the default binary stays dependency-light for the headless service:
+
+```sh
+cargo install astral-watch --features tui    # or: cargo build --release --features tui
+astral-watch tui                              # q / Esc to quit
+```
+
 For Prometheus alongside CSV logging (e.g. the systemd service), add to the config instead:
 
 ```toml
