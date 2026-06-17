@@ -717,12 +717,12 @@ fn draw_help(f: &mut Frame, area: Rect) {
     let lines = vec![
         Line::from("astral-watch — live dashboard".bold()),
         Line::from(""),
-        Line::from("  q / Esc      quit"),
+        Line::from("  q / Ctrl-C   quit (from anywhere)"),
         Line::from("  space        pause / resume sampling"),
         Line::from("  r            reset session peaks"),
         Line::from("  + / -        faster / slower sample rate"),
         Line::from("  Tab / ← →    switch GPU (multi-card)"),
-        Line::from("  ?            toggle this help"),
+        Line::from("  ? / Esc      toggle / close this help"),
         Line::from(""),
         Line::from(vec![
             Span::raw("  thresholds:  overload "),
