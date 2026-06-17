@@ -167,11 +167,12 @@ See [`docs/SAFETY.md`](docs/SAFETY.md).
 - **0.1:** read + decode + alerts + CSV/rotation + service. *(MVP)* ✓
 - **0.1.1:** hardening — CSV integrity, tear-resistant reads, install-path fixes. ✓
 - **0.2:** alert lifecycle (raise/resolve/repeat) + ntfy/webhook/desktop delivery + config file. ✓
-- **0.3 (here):** Prometheus exporter + Grafana dashboard, unified sampler/sink loop;
-  release infrastructure — prebuilt binaries, AUR `PKGBUILD`, crates.io packaging.
-- **next:** a TUI.
+- **0.3:** Prometheus exporter + Grafana dashboard, unified sampler/sink loop;
+  release infrastructure — prebuilt binaries, AUR `PKGBUILD`, crates.io packaging. ✓
+- **0.4 (here):** opt-in TUI dashboard, GPU identity correlation, graceful-shutdown
+  notification flush, card-pinned bus re-detection.
 - **later:** opt-in **safety daemon** (auto power-cap via NVML on sustained overload),
-  high-rate event-capture ring buffer, multi-GPU identity correlation.
+  high-rate event-capture ring buffer.
 
 ## Credits
 
