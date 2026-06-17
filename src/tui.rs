@@ -36,14 +36,17 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Axis, Block, BorderType, Chart, Clear, Dataset, GraphType, LineGauge, List, ListItem, Padding,
+    Axis, Block, BorderType, Chart, Clear, Dataset, Gauge, GraphType, List, ListItem, Padding,
     Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Sparkline, Wrap,
 };
 use ratatui::Frame;
 use std::collections::VecDeque;
+use std::fs;
 use std::io::IsTerminal;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 /// Samples kept for the trend chart / sparklines.
@@ -95,6 +98,124 @@ impl Theme {
     }
 }
 
+/// Best-effort GPU stats from `nvidia-smi` — the i2c chip can't see util/temp/board power.
+#[derive(Clone, Default)]
+struct GpuStat {
+    pci: String, // normalized "bb:dd.f"
+    util: Option<u8>,
+    draw_w: Option<f64>,
+    limit_w: Option<f64>,
+    temp_c: Option<i32>,
+    fan: Option<u8>,
+}
+
+/// Normalize a PCI id so sysfs (`0000:0b:00.0`) and nvidia-smi (`00000000:0B:00.0`) match.
+fn norm_pci(s: &str) -> String {
+    let lower = s.trim().to_ascii_lowercase();
+    match lower.split_once(':') {
+        Some((_, rest)) => rest.to_string(), // drop the domain
+        None => lower,
+    }
+}
+
+fn parse_field<T: std::str::FromStr>(s: &str) -> Option<T> {
+    let s = s.trim();
+    if s.is_empty() || s.starts_with('[') {
+        None // [N/A], [Not Supported]
+    } else {
+        s.parse().ok()
+    }
+}
+
+fn parse_gpu_csv(out: &str) -> Vec<GpuStat> {
+    out.lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split(',').collect();
+            if f.len() < 6 {
+                return None;
+            }
+            Some(GpuStat {
+                pci: norm_pci(f[0]),
+                util: parse_field(f[1]),
+                draw_w: parse_field(f[2]),
+                limit_w: parse_field(f[3]),
+                temp_c: parse_field(f[4]),
+                fan: parse_field(f[5]),
+            })
+        })
+        .collect()
+}
+
+const NVSMI_QUERY: &str =
+    "--query-gpu=pci.bus_id,utilization.gpu,power.draw,power.limit,temperature.gpu,fan.speed";
+
+fn query_nvidia_smi() -> Option<Vec<GpuStat>> {
+    let out = Command::new("nvidia-smi")
+        .args([NVSMI_QUERY, "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| parse_gpu_csv(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Spawn a background poller refreshing GPU stats every ~1.5s. Returns `None` (and starts no
+/// thread) when nvidia-smi isn't available — the header then shows connector + sysfs only.
+fn spawn_gpu_poller(stop: Arc<AtomicBool>) -> Option<Arc<Mutex<Vec<GpuStat>>>> {
+    let initial = query_nvidia_smi()?; // probe; absent/erroring nvidia-smi -> no poller
+    let shared = Arc::new(Mutex::new(initial));
+    let worker = Arc::clone(&shared);
+    let _ = thread::Builder::new()
+        .name("gpu-poll".into())
+        .spawn(move || loop {
+            for _ in 0..10 {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(150));
+            }
+            if let Some(stats) = query_nvidia_smi() {
+                *worker.lock().unwrap() = stats;
+            }
+        });
+    Some(shared)
+}
+
+/// PCIe generation from a `current_link_speed` string like "16.0 GT/s PCIe".
+fn gen_from_speed(s: &str) -> Option<u8> {
+    let gts: f64 = s.split_whitespace().next()?.parse().ok()?;
+    Some(match gts {
+        g if g >= 64.0 => 6,
+        g if g >= 32.0 => 5,
+        g if g >= 16.0 => 4,
+        g if g >= 8.0 => 3,
+        g if g >= 5.0 => 2,
+        _ => 1,
+    })
+}
+
+/// Current PCIe link as `("Gen4×16", at_max)` from sysfs; `at_max` is false when down-trained.
+fn pcie_link(pci: &str) -> Option<(String, bool)> {
+    let base = format!("/sys/bus/pci/devices/{pci}");
+    let cur_s = fs::read_to_string(format!("{base}/current_link_speed")).ok()?;
+    let cur_w: u16 = fs::read_to_string(format!("{base}/current_link_width"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let cur_gen = gen_from_speed(&cur_s)?;
+    let at_max = match (
+        fs::read_to_string(format!("{base}/max_link_speed")),
+        fs::read_to_string(format!("{base}/max_link_width")),
+    ) {
+        (Ok(ms), Ok(mw)) => {
+            gen_from_speed(&ms) == Some(cur_gen) && mw.trim().parse::<u16>().ok() == Some(cur_w)
+        }
+        _ => true,
+    };
+    Some((format!("Gen{cur_gen}×{cur_w}"), at_max))
+}
+
 /// One monitorable card (a GPU answering with plausible telemetry).
 #[derive(Clone)]
 struct CardTab {
@@ -122,9 +243,12 @@ struct App {
     auto: bool,
     metrics: Option<Arc<Metrics>>,
     theme: Theme,
+    /// Background nvidia-smi snapshot (one row per GPU); `None` if nvidia-smi is absent.
+    gpu: Option<Arc<Mutex<Vec<GpuStat>>>>,
 
     reading: Option<Reading>,
     live: bool,
+    link: Option<(String, bool)>, // current PCIe link, and whether it's at the card's max
     status: String,
     active: Vec<Condition>,
 
@@ -153,6 +277,17 @@ impl App {
 
     fn card_pci(&self) -> Option<String> {
         self.auto.then(|| self.cards[self.selected].pci.clone())
+    }
+
+    /// The latest nvidia-smi row for the card currently being viewed, if any.
+    fn gpu_stat(&self) -> Option<GpuStat> {
+        let want = norm_pci(&self.cards[self.selected].pci);
+        let lock = self.gpu.as_ref()?.lock().ok()?;
+        lock.iter().find(|g| g.pci == want).cloned()
+    }
+
+    fn refresh_link(&mut self) {
+        self.link = pcie_link(&self.cards[self.selected].pci);
     }
 
     fn clear_history(&mut self) {
@@ -277,6 +412,7 @@ impl App {
         self.selected = (((self.selected as isize + dir) % n + n) % n) as usize;
         self.clear_history();
         self.misses = 0;
+        self.refresh_link();
         let t = self.cards[self.selected].title();
         self.push_log(format!("viewing {t}"), Color::Gray);
     }
@@ -328,6 +464,9 @@ pub fn run_tui(
         bail!("the tui needs an interactive terminal — use `monitor` (or `log`) for non-interactive output");
     }
     let cards = discover_cards(addr, auto, bus);
+    // best-effort GPU stats from nvidia-smi (util/power/temp/fan); None if it isn't installed
+    let gpu_stop = Arc::new(AtomicBool::new(false));
+    let gpu = spawn_gpu_poller(Arc::clone(&gpu_stop));
     let mut app = App {
         addr,
         cards,
@@ -337,8 +476,10 @@ pub fn run_tui(
         theme: Theme {
             color: std::env::var_os("NO_COLOR").is_none(),
         },
+        gpu,
         reading: None,
         live: false,
+        link: None,
         status: "starting…".into(),
         active: Vec::new(),
         pin_hist: std::array::from_fn(|_| VecDeque::with_capacity(HISTORY)),
@@ -356,6 +497,7 @@ pub fn run_tui(
         samples: 0,
     };
     app.push_log("dashboard started", Color::Gray);
+    app.refresh_link();
     let mut lifecycle = Lifecycle::new(cfg.alerts);
 
     let mut terminal = ratatui::init();
@@ -396,6 +538,7 @@ pub fn run_tui(
             }
         }
     })();
+    gpu_stop.store(true, Ordering::Relaxed); // stop the nvidia-smi poller
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     res
@@ -403,6 +546,7 @@ pub fn run_tui(
 
 fn sample(app: &mut App, lifecycle: &mut Lifecycle, cfg: &Config) {
     let bus = app.current_bus();
+    app.refresh_link(); // cheap sysfs read; reflects live up/down-train
     let mut conditions: Vec<(Condition, String)> = Vec::new();
     match read_reading(bus, app.addr) {
         Ok(r) if r.plausible() => {
@@ -500,79 +644,257 @@ fn panel(theme: &Theme, title: &str) -> Block<'static> {
 }
 
 fn draw(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let compact = area.height < 16; // collapse the device panel to one line on short terminals
+    let multi = app.cards.len() > 1;
     let alarm = !app.active.is_empty();
-    let mut rows = vec![Constraint::Length(if app.cards.len() > 1 { 2 } else { 1 })];
-    if alarm {
-        rows.push(Constraint::Length(1));
+    let mut cons = Vec::new();
+    if multi {
+        cons.push(Constraint::Length(1)); // tabs
     }
-    rows.push(Constraint::Min(6));
-    rows.push(Constraint::Length(1));
-    let areas = Layout::vertical(rows).split(f.area());
-    let mut idx = 0;
-    draw_title(f, areas[idx], app);
-    idx += 1;
+    cons.push(Constraint::Length(if compact { 1 } else { 5 })); // header
     if alarm {
-        draw_alarm(f, areas[idx], app);
-        idx += 1;
+        cons.push(Constraint::Length(1)); // alarm banner
+    }
+    cons.push(Constraint::Min(6)); // body
+    cons.push(Constraint::Length(1)); // keybar
+    let a = Layout::vertical(cons).split(area);
+    let mut i = 0;
+    if multi {
+        draw_tabs(f, a[i], app);
+        i += 1;
+    }
+    if compact {
+        draw_title_compact(f, a[i], app);
+    } else {
+        draw_device(f, a[i], app);
+    }
+    i += 1;
+    if alarm {
+        draw_alarm(f, a[i], app);
+        i += 1;
     }
     match app.focus {
-        Some(p) => draw_panel(f, areas[idx], app, p),
-        None => draw_body(f, areas[idx], app),
+        Some(p) => draw_panel(f, a[i], app, p),
+        None => draw_body(f, a[i], app),
     }
-    idx += 1;
-    draw_keybar(f, areas[idx], app);
+    i += 1;
+    draw_keybar(f, a[i], app);
 
     if app.show_help {
-        draw_help(f, f.area(), app);
+        draw_help(f, area, app);
     }
 }
 
-fn draw_title(f: &mut Frame, area: Rect, app: &App) {
+fn draw_tabs(f: &mut Frame, area: Rect, app: &App) {
+    let t = &app.theme;
+    let mut tabs: Vec<Span> = Vec::new();
+    for (i, c) in app.cards.iter().enumerate() {
+        let label = format!(" {} ", c.model);
+        tabs.push(if i == app.selected {
+            Span::styled(label, t.badge(Color::Cyan))
+        } else {
+            Span::styled(label, Style::default().fg(t.c(Color::Gray)))
+        });
+        tabs.push(Span::raw(" "));
+    }
+    f.render_widget(Line::from(tabs), area);
+}
+
+fn draw_title_compact(f: &mut Frame, area: Rect, app: &App) {
     let t = &app.theme;
     let card = &app.cards[app.selected];
     let mut spans = vec![
         Span::styled(" astral-watch ", t.badge(Color::Cyan)),
         Span::raw(" "),
-        Span::styled(
-            format!("i2c-{} @ {:#04x}", card.bus, app.addr),
-            Style::default().fg(t.c(Color::Gray)),
-        ),
-        Span::raw("  "),
         Span::styled(card.model.clone(), Style::default().fg(t.c(Color::White))),
     ];
+    if let Some((link, at_max)) = &app.link {
+        let c = if *at_max { Color::Green } else { Color::Yellow };
+        spans.push(Span::styled(
+            format!("  PCIe {link}"),
+            Style::default().fg(t.c(c)),
+        ));
+    }
     if app.paused {
         spans.push(Span::styled("  ⏸ PAUSED", t.badge(Color::Yellow)));
     }
+    f.render_widget(Line::from(spans), area);
+}
+
+fn util_color(_u: u8) -> Color {
+    Color::Cyan // utilization is load, not a fault — neutral accent
+}
+fn pwr_color(frac: f64) -> Color {
+    if frac > 0.97 {
+        Color::Red
+    } else if frac > 0.85 {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
+}
+fn temp_color(c: i32) -> Color {
+    if c >= 85 {
+        Color::Red
+    } else if c >= 75 {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
+}
+
+/// An inline text gauge: `LABEL ████░░ value`.
+fn bar_spans(
+    t: &Theme,
+    label: &str,
+    frac: f64,
+    color: Color,
+    width: usize,
+    value: &str,
+) -> Vec<Span<'static>> {
+    let filled = ((frac.clamp(0.0, 1.0)) * width as f64).round() as usize;
+    let filled = filled.min(width);
+    vec![
+        Span::styled(format!("{label} "), Style::default().fg(t.c(Color::Gray))),
+        Span::styled("█".repeat(filled), Style::default().fg(t.c(color))),
+        Span::styled(
+            "░".repeat(width - filled),
+            Style::default().fg(t.c(Color::DarkGray)),
+        ),
+        Span::styled(format!(" {value}"), Style::default().fg(t.c(Color::White))),
+    ]
+}
+
+/// The nvtop-style "device" header: identity + PCIe link, GPU/power/temp/fan, connector summary.
+fn draw_device(f: &mut Frame, area: Rect, app: &App) {
+    let t = &app.theme;
+    let block = panel(t, " device ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
+    let rows = Layout::vertical([Constraint::Length(1); 3]).split(inner);
+    let card = &app.cards[app.selected];
+
+    // line 1 — identity + PCIe link (yellow when down-trained)
+    let mut l0 = vec![
+        Span::styled(" astral-watch ", t.badge(Color::Cyan)),
+        Span::raw("  "),
+        Span::styled(
+            card.model.clone(),
+            Style::default()
+                .fg(t.c(Color::White))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  {}", card.pci),
+            Style::default().fg(t.c(Color::DarkGray)),
+        ),
+    ];
+    if let Some((link, at_max)) = &app.link {
+        let c = if *at_max { Color::Green } else { Color::Yellow };
+        l0.push(Span::styled(
+            format!("  PCIe {link}"),
+            Style::default().fg(t.c(c)),
+        ));
+        if !*at_max {
+            l0.push(Span::styled(" ↓", Style::default().fg(t.c(Color::Yellow))));
+        }
+    }
+    l0.push(Span::styled(
+        format!("  i2c-{} @ {:#04x}", card.bus, app.addr),
+        Style::default().fg(t.c(Color::DarkGray)),
+    ));
     if let Some(p) = app.focus {
-        spans.push(Span::styled(
+        l0.push(Span::styled(
             format!("  [{}]", PANELS[p]),
             Style::default().fg(t.c(Color::Cyan)),
         ));
     }
-    spans.push(Span::styled(
-        format!("   {:.0}ms", app.interval.as_secs_f64() * 1000.0),
-        Style::default().fg(t.c(Color::DarkGray)),
-    ));
-    f.render_widget(Line::from(spans), area);
-
-    if app.cards.len() > 1 && area.height > 1 {
-        let row = Rect {
-            y: area.y + 1,
-            height: 1,
-            ..area
-        };
-        let mut tabs: Vec<Span> = Vec::new();
-        for (i, c) in app.cards.iter().enumerate() {
-            let label = format!(" {} ", c.model);
-            tabs.push(if i == app.selected {
-                Span::styled(label, t.badge(Color::Cyan))
-            } else {
-                Span::styled(label, Style::default().fg(t.c(Color::Gray)))
-            });
-            tabs.push(Span::raw(" "));
-        }
-        f.render_widget(Line::from(tabs), row);
+    if app.paused {
+        l0.push(Span::styled("  ⏸ PAUSED", t.badge(Color::Yellow)));
     }
+    f.render_widget(Line::from(l0), rows[0]);
+
+    // line 2 — GPU load / power / temp / fan (nvidia-smi), or a note when unavailable
+    let l1 = if let Some(g) = app.gpu_stat() {
+        let mut s: Vec<Span> = Vec::new();
+        if let Some(u) = g.util {
+            s.extend(bar_spans(
+                t,
+                "GPU",
+                u as f64 / 100.0,
+                util_color(u),
+                10,
+                &format!("{u}%"),
+            ));
+            s.push(Span::raw("   "));
+        }
+        match (g.draw_w, g.limit_w) {
+            (Some(d), Some(l)) if l > 0.0 => {
+                s.extend(bar_spans(
+                    t,
+                    "PWR",
+                    d / l,
+                    pwr_color(d / l),
+                    10,
+                    &format!("{d:.0}/{l:.0}W"),
+                ));
+                s.push(Span::raw("   "));
+            }
+            (Some(d), _) => s.push(Span::styled(
+                format!("PWR {d:.0}W   "),
+                Style::default().fg(t.c(Color::White)),
+            )),
+            _ => {}
+        }
+        if let Some(c) = g.temp_c {
+            s.push(Span::styled(
+                format!("{c}°C  "),
+                Style::default().fg(t.c(temp_color(c))),
+            ));
+        }
+        if let Some(fan) = g.fan {
+            s.push(Span::styled(
+                format!("fan {fan}%"),
+                Style::default().fg(t.c(Color::Gray)),
+            ));
+        }
+        Line::from(s)
+    } else {
+        Line::from(Span::styled(
+            "GPU stats: nvidia-smi not available (connector data only)",
+            Style::default().fg(t.c(Color::DarkGray)),
+        ))
+    };
+    f.render_widget(l1, rows[1]);
+
+    // line 3 — connector telemetry summary
+    let l2 = if let Some(r) = &app.reading {
+        let bal = r
+            .balance()
+            .map(|b| format!("{b:.2}×"))
+            .unwrap_or_else(|| "—".into());
+        let vmin = r.pins.iter().map(|p| p.volts).fold(f64::INFINITY, f64::min);
+        let vmax = r.pins.iter().map(|p| p.volts).fold(0.0, f64::max);
+        let prefix = if app.live { "" } else { "STALE · " };
+        Line::from(Span::styled(
+            format!(
+                "{prefix}connector  {:.1} A · {:.0} W · balance {bal} · pins {vmin:.2}–{vmax:.2} V",
+                r.total_amps(),
+                r.total_watts(),
+            ),
+            Style::default().fg(t.c(if app.live { Color::Gray } else { Color::Yellow })),
+        ))
+    } else {
+        Line::from(Span::styled(
+            app.status.clone(),
+            Style::default().fg(t.c(Color::Yellow)),
+        ))
+    };
+    f.render_widget(l2, rows[2]);
 }
 
 fn draw_alarm(f: &mut Frame, area: Rect, app: &App) {
@@ -610,7 +932,7 @@ fn draw_body(f: &mut Frame, area: Rect, app: &App) {
         draw_trend(f, trend, app);
         let [stats, balance, watts, log] = Layout::vertical([
             Constraint::Length(4),
-            Constraint::Length(3),
+            Constraint::Length(4),
             Constraint::Length(3),
             Constraint::Min(3),
         ])
@@ -623,7 +945,7 @@ fn draw_body(f: &mut Frame, area: Rect, app: &App) {
         let [bars, stats, balance, log] = Layout::vertical([
             Constraint::Min(7),
             Constraint::Length(4),
-            Constraint::Length(3),
+            Constraint::Length(4),
             Constraint::Min(3),
         ])
         .areas(area);
@@ -817,22 +1139,30 @@ fn draw_balance(f: &mut Frame, area: Rect, app: &App) {
     let ratio = bal
         .map(|b| ((b - 1.0) / (IMBALANCE_RATIO - 1.0)).clamp(0.0, 1.0))
         .unwrap_or(0.0);
-    let (color, label) = match bal {
-        Some(b) if b > IMBALANCE_RATIO => (Color::Red, format!("{b:.2}× IMBALANCED")),
-        Some(b) if b > 1.0 + (IMBALANCE_RATIO - 1.0) * 0.66 => (Color::Yellow, format!("{b:.2}×")),
-        Some(b) => (Color::Green, format!("{b:.2}×")),
-        None => (Color::DarkGray, "—".into()),
+    // normal / warn / alarm zones, colored green / yellow / red
+    let (color, status) = match bal {
+        Some(b) if b > IMBALANCE_RATIO => (Color::Red, "ALARM"),
+        Some(b) if b > 1.0 + (IMBALANCE_RATIO - 1.0) * 0.66 => (Color::Yellow, "WARN"),
+        Some(_) => (Color::Green, "NORMAL"),
+        None => (Color::DarkGray, "idle"),
+    };
+    let label = match bal {
+        Some(b) => format!("{b:.2}×  {status}"),
+        None => "—  idle".into(),
     };
     let title = format!(
-        " balance hi/lo (alarm >{IMBALANCE_RATIO}×, peak {:.2}) ",
+        " balance hi/lo · alarm >{IMBALANCE_RATIO}× · peak {:.2}× ",
         app.peak_balance
     );
     f.render_widget(
-        LineGauge::default()
+        Gauge::default()
             .block(panel(t, &title))
-            .filled_style(Style::default().fg(t.c(color)))
-            .label(label)
-            .ratio(if app.live { ratio } else { 0.0 }),
+            .gauge_style(Style::default().fg(t.c(color)))
+            .ratio(if app.live { ratio } else { 0.0 })
+            .label(Span::styled(
+                label,
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
         area,
     );
 }
@@ -986,6 +1316,7 @@ mod tests {
             auto: true,
             metrics: None,
             theme: Theme { color: true },
+            gpu: None,
             reading: Some(Reading {
                 pins: amps.map(|x| Pin {
                     volts: 11.97,
@@ -993,6 +1324,7 @@ mod tests {
                 }),
             }),
             live: true,
+            link: Some(("Gen4×16".into(), false)),
             status: "ok".into(),
             active: Vec::new(),
             pin_hist: std::array::from_fn(|_| VecDeque::new()),
@@ -1042,6 +1374,68 @@ mod tests {
         assert!(s.contains('┄'), "9.2A limit line drawn");
         assert!(s.contains('█'), "bar fill drawn");
         assert!(s.contains("p1") && s.contains("p6"), "pin labels");
+    }
+
+    #[test]
+    fn device_header_shows_link_and_connector() {
+        let s = screen(&app([8.2, 8.6, 8.3, 8.4, 8.5, 8.8]), 130, 40);
+        assert!(s.contains("device"), "device panel");
+        assert!(s.contains("ROG Astral RTX 5090"), "model");
+        assert!(s.contains("PCIe Gen4×16"), "pcie link from sysfs");
+        assert!(
+            s.contains("connector") && s.contains("balance"),
+            "telemetry summary"
+        );
+        assert!(
+            s.contains("nvidia-smi not available"),
+            "gpu line degrades when no stats"
+        );
+    }
+
+    #[test]
+    fn device_header_shows_gpu_stats_when_present() {
+        let mut a = app([8.0; 6]);
+        a.gpu = Some(Arc::new(Mutex::new(vec![GpuStat {
+            pci: "0b:00.0".into(), // normalized to match card 0000:0b:00.0
+            util: Some(100),
+            draw_w: Some(320.0),
+            limit_w: Some(600.0),
+            temp_c: Some(69),
+            fan: Some(62),
+        }])));
+        let s = screen(&a, 130, 40);
+        assert!(s.contains("GPU") && s.contains("100%"), "util");
+        assert!(
+            s.contains("PWR") && s.contains("320/600W"),
+            "power draw/limit"
+        );
+        assert!(s.contains("69°C") && s.contains("fan 62%"), "temp + fan");
+    }
+
+    #[test]
+    fn balance_gauge_status_words() {
+        // normal
+        assert!(screen(&app([8.0; 6]), 130, 40).contains("NORMAL"));
+        // alarm (one pin way high -> ratio > 1.5)
+        let s = screen(&app([12.0, 6.0, 8.0, 8.0, 8.0, 8.0]), 130, 40);
+        assert!(s.contains("ALARM"), "imbalanced -> ALARM: {s}");
+    }
+
+    #[test]
+    fn parse_gpu_csv_handles_na() {
+        let v = parse_gpu_csv("00000000:0B:00.0, 100, 320.36, 600.00, 69, [N/A]\n");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].pci, "0b:00.0");
+        assert_eq!(v[0].util, Some(100));
+        assert_eq!(v[0].limit_w, Some(600.0));
+        assert_eq!(v[0].fan, None); // [N/A] -> None, not a parse panic
+    }
+
+    #[test]
+    fn gen_from_speed_maps() {
+        assert_eq!(gen_from_speed("16.0 GT/s PCIe"), Some(4));
+        assert_eq!(gen_from_speed("32.0 GT/s PCIe"), Some(5));
+        assert_eq!(gen_from_speed("2.5 GT/s PCIe"), Some(1));
     }
 
     #[test]

@@ -7,7 +7,16 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Added
+- **TUI device header** — an nvtop-style header panel: card model, **PCIe link** (gen×width
+  from sysfs, flagged when down-trained), a **GPU utilization** bar and **power draw/limit**
+  bar with temp and fan from a best-effort background `nvidia-smi` poll (gracefully omitted
+  when nvidia-smi is absent — no hard dependency, the i2c core stays read-only), and a
+  one-line connector telemetry summary.
+
 ### Changed
+- **TUI balance gauge** — the hi/lo balance bar is now a thick block gauge colored
+  green/yellow/red with a `NORMAL`/`WARN`/`ALARM` status word.
 - **TUI overhaul** — the `tui` dashboard went from a basic single screen to a full one:
   a per-pin **current bar chart** with a 9.2 A limit line and session peak caps, a per-pin
   **divergence trend chart**, a balance gauge, a watts sparkline, and a **scrollable** alert
