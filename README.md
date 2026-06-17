@@ -169,8 +169,11 @@ See [`docs/SAFETY.md`](docs/SAFETY.md).
 - **0.2:** alert lifecycle (raise/resolve/repeat) + ntfy/webhook/desktop delivery + config file. ✓
 - **0.3:** Prometheus exporter + Grafana dashboard, unified sampler/sink loop;
   release infrastructure — prebuilt binaries, AUR `PKGBUILD`, crates.io packaging. ✓
-- **0.4 (here):** opt-in TUI dashboard, GPU identity correlation, graceful-shutdown
-  notification flush, card-pinned bus re-detection.
+- **0.4:** opt-in TUI, GPU identity correlation, graceful-shutdown notification flush,
+  card-pinned bus re-detection. ✓
+- **0.5 (here):** full TUI dashboard — per-pin bars + divergence trend chart, nvtop-style
+  device header (PCIe link, GPU/power/temp via best-effort nvidia-smi), zoned balance gauge,
+  alert log, multi-GPU tabs, panel zoom, theming.
 - **later:** opt-in **safety daemon** (auto power-cap via NVML on sustained overload),
   high-rate event-capture ring buffer.
 

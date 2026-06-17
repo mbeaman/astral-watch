@@ -1,6 +1,6 @@
 # Maintainer: Matt Beaman <matthew.a.beaman@gmail.com>
 pkgname=astral-watch
-pkgver=0.4.0
+pkgver=0.5.0
 pkgrel=1
 pkgdesc="Per-pin 12V-2x6 power monitoring and connector-melt early-warning for ASUS ROG Astral GPUs"
 arch=('x86_64')
@@ -11,7 +11,7 @@ makedepends=('cargo')
 backup=('etc/astral-watch.toml')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 # refresh with: updpkgsums  (or curl -L <tarball-url> | sha256sum)
-sha256sums=('e1bd6f2d76de98147cc7f89a6f9a7103ff760c7b79537f5058d91f489e6af9cc')
+sha256sums=('UPDATE-AFTER-TAG')
 
 prepare() {
   cd "$pkgname-$pkgver"

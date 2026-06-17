@@ -5,7 +5,7 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] - 2026-06-17
 
 ### Added
 - **TUI device header** — an nvtop-style header panel: card model, **PCIe link** (gen×width
@@ -128,7 +128,7 @@ Initial release: per-pin 12V-2x6 telemetry (ITE IT8915FN over `/dev/i2c-*`), liv
 auto-rotating CSV logging with falloff capture, overload/disconnect/imbalance alerts,
 hardened systemd service + udev rule, read-only safety design (`docs/SAFETY.md`).
 
-[Unreleased]: https://github.com/mbeaman/astral-watch/compare/v0.4.0...HEAD
+[0.5.0]: https://github.com/mbeaman/astral-watch/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/mbeaman/astral-watch/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/mbeaman/astral-watch/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/mbeaman/astral-watch/compare/v0.2.0...v0.3.0
