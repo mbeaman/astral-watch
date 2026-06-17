@@ -5,6 +5,14 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **TUI overhaul** — the `tui` dashboard gained a per-pin divergence trend chart, session
+  peak-hold on the bars, a balance gauge, an alert event log, multi-GPU tabs, a full-width
+  alarm banner, a responsive layout, and a key map (pause, reset peaks, live sample rate,
+  card switch, help overlay) with a persistent keybind bar.
+
 ## [0.4.0] - 2026-06-16
 
 ### Added
@@ -107,6 +115,7 @@ Initial release: per-pin 12V-2x6 telemetry (ITE IT8915FN over `/dev/i2c-*`), liv
 auto-rotating CSV logging with falloff capture, overload/disconnect/imbalance alerts,
 hardened systemd service + udev rule, read-only safety design (`docs/SAFETY.md`).
 
+[Unreleased]: https://github.com/mbeaman/astral-watch/compare/v0.4.0...HEAD
 [0.4.0]: https://github.com/mbeaman/astral-watch/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/mbeaman/astral-watch/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/mbeaman/astral-watch/compare/v0.2.0...v0.3.0
