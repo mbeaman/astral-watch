@@ -1,17 +1,20 @@
 //! Live full-screen terminal dashboard (opt-in `tui` feature).
 //!
-//! A focused connector-health view: per-pin current as both an at-a-glance bar chart and a
-//! divergence trend chart (the melt signal is one pin drifting away from the others over
-//! time), with peak-hold, a balance gauge + history, a watts sparkline, a debounced alert
-//! event log, and a full-width alarm banner. Multi-GPU systems get a tab per card.
+//! A focused connector-health view: per-pin current as both an at-a-glance bar chart (with a
+//! 9.2 A limit line and session peak caps) and a divergence trend chart (the melt signal is
+//! one pin drifting away from the others over time), plus a balance gauge, a watts sparkline,
+//! and a scrollable debounced alert event log. Multi-GPU systems get a tab per card; any
+//! panel can be zoomed full-screen.
 //!
 //! It reuses the shared read/decode/evaluate path, the alert lifecycle, the card-pinned bus
 //! re-detection, and the metrics cache (so a configured exporter still serves live data) — it
 //! renders to the screen instead of CSV, and doesn't send notifications (you're watching it).
 //!
-//! Keys: `q`/`Esc` quit · `space` pause · `r` reset peaks · `+`/`-` sample rate ·
-//! `Tab`/`shift-Tab` switch card · `?` help. `ratatui::init`/`restore` install a panic hook
-//! that restores the terminal; the loop bails cleanly when stdout isn't a TTY.
+//! Styling is terminal-theme-respecting: emphasis uses reverse-video rather than hardcoded
+//! backgrounds, and `NO_COLOR` disables color entirely, so it reads on light and dark.
+//!
+//! Keys: `q`/`Ctrl-C` quit · `space` pause · `r` reset peaks · `+`/`-` rate · `Tab` card ·
+//! `1`-`5` zoom a panel (`0`/`Esc` back) · `↑`/`↓`/wheel scroll the log · `?` help.
 
 use crate::alert::{evaluate, IMBALANCE_RATIO, MIN_LOAD_A, OVERLOAD_A};
 use crate::cards::gpu_at;
@@ -22,14 +25,19 @@ use crate::lifecycle::{condition_of, Condition, Event, Lifecycle};
 use crate::metrics::Metrics;
 use anyhow::{bail, Result};
 use chrono::Local;
-use ratatui::crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::buffer::Buffer;
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event as TermEvent, KeyCode, KeyEventKind,
+    KeyModifiers, MouseEventKind,
+};
+use ratatui::crossterm::execute;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Axis, Bar, BarChart, BarGroup, Block, Chart, Clear, Dataset, GraphType, LineGauge, List,
-    ListItem, Paragraph, Sparkline, Wrap,
+    Axis, Block, BorderType, Chart, Clear, Dataset, GraphType, LineGauge, List, ListItem, Padding,
+    Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Sparkline, Wrap,
 };
 use ratatui::Frame;
 use std::collections::VecDeque;
@@ -58,6 +66,35 @@ const PIN_COLORS: [Color; PIN_COUNT] = [
     Color::LightRed,
 ];
 
+/// The zoomable panels, in `1`..`5` key order.
+const PANELS: [&str; 5] = ["bars", "trend", "balance", "watts", "log"];
+
+/// Color resolver: collapses to the terminal default when `NO_COLOR` is set.
+#[derive(Clone, Copy)]
+struct Theme {
+    color: bool,
+}
+
+impl Theme {
+    fn c(&self, c: Color) -> Color {
+        if self.color {
+            c
+        } else {
+            Color::Reset
+        }
+    }
+    /// A style for emphasis that adapts to light/dark via reverse-video.
+    fn badge(&self, c: Color) -> Style {
+        if self.color {
+            Style::default()
+                .fg(c)
+                .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        }
+    }
+}
+
 /// One monitorable card (a GPU answering with plausible telemetry).
 #[derive(Clone)]
 struct CardTab {
@@ -82,28 +119,27 @@ struct App {
     addr: u16,
     cards: Vec<CardTab>,
     selected: usize,
-    /// Re-detect only when the bus was auto-detected (never overrides a pinned `--bus`).
     auto: bool,
     metrics: Option<Arc<Metrics>>,
+    theme: Theme,
 
     reading: Option<Reading>,
     live: bool,
     status: String,
     active: Vec<Condition>,
 
-    // history (cleared on a card switch)
     pin_hist: [VecDeque<f64>; PIN_COUNT],
     pin_peak: [f64; PIN_COUNT],
-    balance_hist: VecDeque<u64>, // centi-units for the sparkline
     watts_hist: VecDeque<u64>,
     peak_watts: f64,
     peak_balance: f64,
 
     log: VecDeque<LogLine>,
+    log_scroll: usize, // lines scrolled back from the newest (0 = tailing)
 
-    // interaction
     paused: bool,
     show_help: bool,
+    focus: Option<usize>, // zoomed panel index into PANELS
     interval: Duration,
 
     misses: u32,
@@ -116,7 +152,6 @@ impl App {
     }
 
     fn card_pci(&self) -> Option<String> {
-        // re-detect target: only when auto-detected
         self.auto.then(|| self.cards[self.selected].pci.clone())
     }
 
@@ -125,7 +160,6 @@ impl App {
             h.clear();
         }
         self.pin_peak = [0.0; PIN_COUNT];
-        self.balance_hist.clear();
         self.watts_hist.clear();
         self.peak_watts = 0.0;
         self.peak_balance = 0.0;
@@ -149,6 +183,15 @@ impl App {
             text: text.into(),
             color,
         });
+        if self.log_scroll > 0 {
+            self.log_scroll += 1; // keep the viewport anchored while scrolled back
+        }
+    }
+
+    fn scroll_log(&mut self, delta: isize) {
+        let max = self.log.len().saturating_sub(1);
+        let next = self.log_scroll as isize + delta;
+        self.log_scroll = next.clamp(0, max as isize) as usize;
     }
 
     fn push_hist(&mut self, r: &Reading) {
@@ -172,10 +215,6 @@ impl App {
             self.peak_watts = w;
         }
         if let Some(b) = r.balance() {
-            if self.balance_hist.len() == HISTORY {
-                self.balance_hist.pop_front();
-            }
-            self.balance_hist.push_back((b * 100.0) as u64);
             if b > self.peak_balance {
                 self.peak_balance = b;
             }
@@ -184,18 +223,24 @@ impl App {
 
     /// Returns true to quit.
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
-        // quit works from anywhere, including with the help overlay open
+        // quit works from anywhere
         if matches!(code, KeyCode::Char('q'))
             || (matches!(code, KeyCode::Char('c')) && mods.contains(KeyModifiers::CONTROL))
         {
             return true;
         }
         if self.show_help {
-            self.show_help = false; // any other key dismisses help
+            self.show_help = false; // any other key closes help
             return false;
         }
         match code {
-            KeyCode::Esc => return true,
+            KeyCode::Esc => {
+                if self.focus.is_some() {
+                    self.focus = None; // Esc first leaves a zoomed panel
+                } else {
+                    return true;
+                }
+            }
             KeyCode::Char(' ') => {
                 self.paused = !self.paused;
                 self.push_log(if self.paused { "paused" } else { "resumed" }, Color::Gray);
@@ -208,8 +253,16 @@ impl App {
             KeyCode::Char('-') | KeyCode::Char('_') => {
                 self.interval = (self.interval * 2).min(MAX_INTERVAL);
             }
+            KeyCode::Char('0') => self.focus = None,
+            KeyCode::Char(d @ '1'..='5') => {
+                self.focus = Some((d as u8 - b'1') as usize);
+            }
             KeyCode::Tab | KeyCode::Right => self.switch_card(1),
             KeyCode::BackTab | KeyCode::Left => self.switch_card(-1),
+            KeyCode::Up => self.scroll_log(1),
+            KeyCode::Down => self.scroll_log(-1),
+            KeyCode::PageUp => self.scroll_log(10),
+            KeyCode::PageDown => self.scroll_log(-10),
             _ => {}
         }
         false
@@ -255,7 +308,7 @@ fn discover_cards(addr: u16, auto: bool, bus: u32) -> Vec<CardTab> {
         }
     }
     if out.is_empty() {
-        out.push(mk(bus)); // fall back to the acquired bus
+        out.push(mk(bus));
     }
     out
 }
@@ -280,19 +333,23 @@ pub fn run_tui(
         selected: 0,
         auto,
         metrics: metrics.clone(),
+        theme: Theme {
+            color: std::env::var_os("NO_COLOR").is_none(),
+        },
         reading: None,
         live: false,
         status: "starting…".into(),
         active: Vec::new(),
         pin_hist: std::array::from_fn(|_| VecDeque::with_capacity(HISTORY)),
         pin_peak: [0.0; PIN_COUNT],
-        balance_hist: VecDeque::with_capacity(HISTORY),
         watts_hist: VecDeque::with_capacity(HISTORY),
         peak_watts: 0.0,
         peak_balance: 0.0,
         log: VecDeque::with_capacity(LOG_CAP),
+        log_scroll: 0,
         paused: false,
         show_help: false,
+        focus: None,
         interval,
         misses: 0,
         samples: 0,
@@ -301,6 +358,7 @@ pub fn run_tui(
     let mut lifecycle = Lifecycle::new(cfg.alerts);
 
     let mut terminal = ratatui::init();
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
     let res = (|| -> Result<()> {
         let mut next_sample = Instant::now();
         loop {
@@ -314,14 +372,24 @@ pub fn run_tui(
             terminal.draw(|f| draw(f, &app))?;
             let poll = app.interval.min(Duration::from_millis(150));
             if event::poll(poll)? {
-                if let TermEvent::Key(k) = event::read()? {
-                    if k.kind != KeyEventKind::Release && app.on_key(k.code, k.modifiers) {
-                        return Ok(());
+                match event::read()? {
+                    // on_key applies its side effect and returns true to quit
+                    TermEvent::Key(k)
+                        if k.kind != KeyEventKind::Release && app.on_key(k.code, k.modifiers) =>
+                    {
+                        return Ok(())
                     }
+                    TermEvent::Mouse(m) => match m.kind {
+                        MouseEventKind::ScrollUp => app.scroll_log(1),
+                        MouseEventKind::ScrollDown => app.scroll_log(-1),
+                        _ => {}
+                    },
+                    _ => {}
                 }
             }
         }
     })();
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     res
 }
@@ -393,14 +461,45 @@ fn sample(app: &mut App, lifecycle: &mut Lifecycle, cfg: &Config) {
 
 // ─────────────────────────── rendering ───────────────────────────
 
+fn set_cell(buf: &mut Buffer, x: u16, y: u16, ch: char, style: Style) {
+    if let Some(c) = buf.cell_mut((x, y)) {
+        c.set_symbol(ch.encode_utf8(&mut [0u8; 4]));
+        c.set_style(style);
+    }
+}
+
+/// Write `text` centered in the column slot `[x0, x0+slot)` at row `y`.
+fn put_centered(buf: &mut Buffer, x0: u16, slot: u16, y: u16, text: &str, style: Style) {
+    let tw = text.chars().count() as u16;
+    let off = slot.saturating_sub(tw) / 2;
+    for (i, ch) in text.chars().enumerate() {
+        let x = x0 + off + i as u16;
+        if x >= x0 + slot {
+            break;
+        }
+        set_cell(buf, x, y, ch, style);
+    }
+}
+
+fn panel(theme: &Theme, title: &str) -> Block<'static> {
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.c(Color::DarkGray)))
+        .padding(Padding::horizontal(1))
+        .title(Span::styled(
+            title.to_string(),
+            Style::default().fg(theme.c(Color::Gray)),
+        ))
+}
+
 fn draw(f: &mut Frame, app: &App) {
     let alarm = !app.active.is_empty();
-    let mut rows = vec![Constraint::Length(if app.cards.len() > 1 { 2 } else { 1 })]; // title (+tabs)
+    let mut rows = vec![Constraint::Length(if app.cards.len() > 1 { 2 } else { 1 })];
     if alarm {
-        rows.push(Constraint::Length(1)); // alarm banner
+        rows.push(Constraint::Length(1));
     }
-    rows.push(Constraint::Min(8)); // body
-    rows.push(Constraint::Length(1)); // status/key bar
+    rows.push(Constraint::Min(6));
+    rows.push(Constraint::Length(1));
     let areas = Layout::vertical(rows).split(f.area());
     let mut idx = 0;
     draw_title(f, areas[idx], app);
@@ -409,37 +508,47 @@ fn draw(f: &mut Frame, app: &App) {
         draw_alarm(f, areas[idx], app);
         idx += 1;
     }
-    draw_body(f, areas[idx], app);
+    match app.focus {
+        Some(p) => draw_panel(f, areas[idx], app, p),
+        None => draw_body(f, areas[idx], app),
+    }
     idx += 1;
     draw_keybar(f, areas[idx], app);
 
     if app.show_help {
-        draw_help(f, f.area());
+        draw_help(f, f.area(), app);
     }
 }
 
 fn draw_title(f: &mut Frame, area: Rect, app: &App) {
+    let t = &app.theme;
     let card = &app.cards[app.selected];
     let mut spans = vec![
-        " astral-watch ".bold().bg(Color::Cyan).fg(Color::Black),
+        Span::styled(" astral-watch ", t.badge(Color::Cyan)),
         Span::raw(" "),
         Span::styled(
             format!("i2c-{} @ {:#04x}", card.bus, app.addr),
-            Style::default().fg(Color::Gray),
+            Style::default().fg(t.c(Color::Gray)),
         ),
         Span::raw("  "),
-        Span::styled(card.model.clone(), Style::default().fg(Color::White)),
+        Span::styled(card.model.clone(), Style::default().fg(t.c(Color::White))),
     ];
     if app.paused {
-        spans.push("  ⏸ PAUSED".bold().fg(Color::Yellow));
+        spans.push(Span::styled("  ⏸ PAUSED", t.badge(Color::Yellow)));
+    }
+    if let Some(p) = app.focus {
+        spans.push(Span::styled(
+            format!("  [{}]", PANELS[p]),
+            Style::default().fg(t.c(Color::Cyan)),
+        ));
     }
     spans.push(Span::styled(
         format!("   {:.0}ms", app.interval.as_secs_f64() * 1000.0),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(t.c(Color::DarkGray)),
     ));
     f.render_widget(Line::from(spans), area);
 
-    if app.cards.len() > 1 {
+    if app.cards.len() > 1 && area.height > 1 {
         let row = Rect {
             y: area.y + 1,
             height: 1,
@@ -449,12 +558,9 @@ fn draw_title(f: &mut Frame, area: Rect, app: &App) {
         for (i, c) in app.cards.iter().enumerate() {
             let label = format!(" {} ", c.model);
             tabs.push(if i == app.selected {
-                Span::styled(
-                    label,
-                    Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
-                )
+                Span::styled(label, t.badge(Color::Cyan))
             } else {
-                Span::styled(label, Style::default().fg(Color::Gray))
+                Span::styled(label, Style::default().fg(t.c(Color::Gray)))
             });
             tabs.push(Span::raw(" "));
         }
@@ -463,23 +569,27 @@ fn draw_title(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_alarm(f: &mut Frame, area: Rect, app: &App) {
+    let t = &app.theme;
     let names: Vec<&str> = app.active.iter().map(|c| c.label()).collect();
     let text = format!("  ⚠  ALERT: {}  ⚠", names.join("  +  "));
+    let style = if t.color {
+        Style::default()
+            .bg(Color::Red)
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD | Modifier::SLOW_BLINK)
+    } else {
+        Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD | Modifier::SLOW_BLINK)
+    };
     f.render_widget(
-        Paragraph::new(text).alignment(Alignment::Center).style(
-            Style::default()
-                .bg(Color::Red)
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD | Modifier::SLOW_BLINK),
-        ),
+        Paragraph::new(text)
+            .alignment(Alignment::Center)
+            .style(style),
         area,
     );
 }
 
 fn draw_body(f: &mut Frame, area: Rect, app: &App) {
-    // responsive: wide => bars+trend on the left, stats/sparks/log on the right;
-    // narrow => single column; tiny => just the bars
-    if area.height < 8 {
+    if area.height < 6 {
         draw_bars(f, area, app);
         return;
     }
@@ -517,6 +627,17 @@ fn draw_body(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+/// One zoomed panel filling the body.
+fn draw_panel(f: &mut Frame, area: Rect, app: &App, p: usize) {
+    match p {
+        0 => draw_bars(f, area, app),
+        1 => draw_trend(f, area, app),
+        2 => draw_balance(f, area, app),
+        3 => draw_watts(f, area, app),
+        _ => draw_log(f, area, app),
+    }
+}
+
 fn pin_color(amps: f64, live: bool) -> Color {
     if !live {
         Color::DarkGray
@@ -531,34 +652,78 @@ fn pin_color(amps: f64, live: bool) -> Color {
     }
 }
 
+/// Custom vertical bars with a 9.2 A limit line and per-pin session peak caps.
 fn draw_bars(f: &mut Frame, area: Rect, app: &App) {
-    let ceil_centi = (AMPS_CEILING * 100.0) as u64;
-    let bars: Vec<Bar> = (0..PIN_COUNT)
-        .map(|i| {
-            let amps = app.reading.map(|r| r.pins[i].amps).unwrap_or(0.0);
-            let pk = app.pin_peak[i];
-            Bar::default()
-                .value(((amps * 100.0) as u64).min(ceil_centi))
-                .text_value(format!("{amps:.2} ▲{pk:.2}"))
-                .label(Line::from(format!("p{}", i + 1)))
-                .style(Style::default().fg(pin_color(amps, app.live)))
-        })
-        .collect();
-    let title = format!(" per-pin current — overload {OVERLOAD_A}A (▲ = session peak) ");
-    f.render_widget(
-        BarChart::default()
-            .block(Block::bordered().title(title))
-            .data(BarGroup::default().bars(&bars))
-            .bar_width(9)
-            .bar_gap(2)
-            .max(ceil_centi),
-        area,
-    );
+    let t = app.theme;
+    let block = panel(&t, " per-pin current — limit 9.2A · ▔ peak ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < PIN_COUNT as u16 || inner.height < 3 {
+        return;
+    }
+    let slot = inner.width / PIN_COUNT as u16;
+    let bw = slot.saturating_sub(1).max(1);
+    let label_y = inner.bottom() - 1;
+    let value_y = inner.bottom() - 2;
+    let bar_bottom = value_y - 1; // last bar row
+    let bar_h = bar_bottom.saturating_sub(inner.y) + 1; // rows for the fill
+    let cells_for = |amps: f64| -> u16 {
+        let c = (amps / AMPS_CEILING).clamp(0.0, 1.0) * bar_h as f64;
+        (c.round() as u16).min(bar_h)
+    };
+    let buf = f.buffer_mut();
+    for i in 0..PIN_COUNT {
+        let amps = app.reading.map(|r| r.pins[i].amps).unwrap_or(0.0);
+        let color = Style::default().fg(t.c(pin_color(amps, app.live)));
+        let x0 = inner.x + slot * i as u16;
+        let fill = cells_for(amps);
+        for r in 0..fill {
+            for col in 0..bw {
+                set_cell(buf, x0 + col, bar_bottom - r, '█', color);
+            }
+        }
+        // peak cap
+        let peak = app.pin_peak[i];
+        if peak > 0.0 {
+            let pr = cells_for(peak).saturating_sub(1);
+            let pstyle = Style::default()
+                .fg(t.c(Color::White))
+                .add_modifier(Modifier::DIM);
+            for col in 0..bw {
+                set_cell(buf, x0 + col, bar_bottom - pr, '▔', pstyle);
+            }
+        }
+        put_centered(buf, x0, slot, value_y, &format!("{amps:.1}"), color);
+        put_centered(
+            buf,
+            x0,
+            slot,
+            label_y,
+            &format!("p{}", i + 1),
+            Style::default().fg(t.c(Color::Gray)),
+        );
+    }
+    // the 9.2 A limit line, drawn across all slots
+    let lr = cells_for(OVERLOAD_A).saturating_sub(1);
+    let ly = bar_bottom - lr;
+    let lstyle = Style::default()
+        .fg(t.c(Color::Red))
+        .add_modifier(Modifier::DIM);
+    for x in inner.x..inner.x + slot * PIN_COUNT as u16 {
+        // only on empty cells, so the line doesn't punch holes through bar fill
+        let empty = buf
+            .cell(ratatui::layout::Position { x, y: ly })
+            .map(|c| c.symbol() == " ")
+            .unwrap_or(false);
+        if empty {
+            set_cell(buf, x, ly, '┄', lstyle);
+        }
+    }
 }
 
 fn draw_trend(f: &mut Frame, area: Rect, app: &App) {
-    let block = Block::bordered().title(" per-pin trend — divergence precedes a melt ");
-    // build per-pin (x,y) series from history
+    let t = &app.theme;
+    let block = panel(t, " per-pin trend — divergence precedes a melt ");
     let series: Vec<Vec<(f64, f64)>> = (0..PIN_COUNT)
         .map(|i| {
             app.pin_hist[i]
@@ -581,45 +746,57 @@ fn draw_trend(f: &mut Frame, area: Rect, app: &App) {
                 .name(format!("p{}", i + 1))
                 .marker(symbols::Marker::Braille)
                 .graph_type(GraphType::Line)
-                .style(Style::default().fg(PIN_COLORS[i]))
+                .style(Style::default().fg(t.c(PIN_COLORS[i])))
                 .data(&series[i])
         })
         .collect();
     let chart = Chart::new(datasets)
         .block(block)
         .x_axis(Axis::default().bounds([0.0, len.max(1.0)]))
-        .y_axis(Axis::default().bounds([0.0, ymax * 1.05]).labels([
-            "0".to_string(),
-            format!("{:.0}", ymax / 2.0),
-            format!("{ymax:.0}A"),
-        ]));
+        .y_axis(
+            Axis::default()
+                .bounds([0.0, ymax * 1.05])
+                .labels(["0".to_string(), format!("{ymax:.0}A")]),
+        );
     f.render_widget(chart, area);
 }
 
 fn draw_stats(f: &mut Frame, area: Rect, app: &App) {
-    let block = Block::bordered().title(" totals ");
+    let t = &app.theme;
+    let block = panel(t, " totals ");
     let lines = if let Some(r) = &app.reading {
         let vmin = r.pins.iter().map(|p| p.volts).fold(f64::INFINITY, f64::min);
         let vmax = r.pins.iter().map(|p| p.volts).fold(0.0, f64::max);
         let stale = if app.live { "" } else { "STALE " };
         vec![
             Line::from(vec![
-                Span::raw(format!("{stale}{:.1} A", r.total_amps())).fg(if app.live {
-                    Color::White
-                } else {
-                    Color::Yellow
-                }),
-                Span::raw(format!("   ~{:.0} W", r.total_watts())).fg(Color::White),
-                Span::raw(format!("   peak {:.0} W", app.peak_watts)).fg(Color::DarkGray),
+                Span::styled(
+                    format!("{stale}{:.1} A", r.total_amps()),
+                    Style::default().fg(t.c(if app.live {
+                        Color::White
+                    } else {
+                        Color::Yellow
+                    })),
+                ),
+                Span::styled(
+                    format!("   ~{:.0} W", r.total_watts()),
+                    Style::default().fg(t.c(Color::White)),
+                ),
+                Span::styled(
+                    format!("   peak {:.0} W", app.peak_watts),
+                    Style::default().fg(t.c(Color::DarkGray)),
+                ),
             ]),
-            Line::from(format!(
-                "pins {vmin:.2}–{vmax:.2} V   ·   samples {}",
-                app.samples
-            ))
-            .fg(Color::Gray),
+            Line::from(Span::styled(
+                format!("pins {vmin:.2}–{vmax:.2} V   ·   samples {}", app.samples),
+                Style::default().fg(t.c(Color::Gray)),
+            )),
         ]
     } else {
-        vec![Line::from(app.status.clone()).fg(Color::Yellow)]
+        vec![Line::from(Span::styled(
+            app.status.clone(),
+            Style::default().fg(t.c(Color::Yellow)),
+        ))]
     };
     f.render_widget(
         Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
@@ -628,6 +805,7 @@ fn draw_stats(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_balance(f: &mut Frame, area: Rect, app: &App) {
+    let t = &app.theme;
     let bal = app.reading.as_ref().and_then(|r| r.balance());
     let ratio = bal
         .map(|b| ((b - 1.0) / (IMBALANCE_RATIO - 1.0)).clamp(0.0, 1.0))
@@ -644,8 +822,8 @@ fn draw_balance(f: &mut Frame, area: Rect, app: &App) {
     );
     f.render_widget(
         LineGauge::default()
-            .block(Block::bordered().title(title))
-            .filled_style(Style::default().fg(color))
+            .block(panel(t, &title))
+            .filled_style(Style::default().fg(t.c(color)))
             .label(label)
             .ratio(if app.live { ratio } else { 0.0 }),
         area,
@@ -653,49 +831,67 @@ fn draw_balance(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_watts(f: &mut Frame, area: Rect, app: &App) {
+    let t = &app.theme;
     let data: Vec<u64> = app.watts_hist.iter().copied().collect();
     f.render_widget(
         Sparkline::default()
-            .block(Block::bordered().title(" total watts "))
+            .block(panel(t, " total watts "))
             .data(&data)
-            .style(Style::default().fg(Color::Cyan)),
+            .style(Style::default().fg(t.c(Color::Cyan))),
         area,
     );
 }
 
 fn draw_log(f: &mut Frame, area: Rect, app: &App) {
-    let block = Block::bordered().title(" alert log ");
-    let rows = area.height.saturating_sub(2) as usize;
+    let t = &app.theme;
+    let block = panel(t, " alert log ");
+    let inner = block.inner(area);
+    let rows = inner.height as usize;
+    let total = app.log.len();
+    // newest at the bottom; log_scroll lines back from the end
+    let end = total.saturating_sub(app.log_scroll);
+    let start = end.saturating_sub(rows);
     let items: Vec<ListItem> = app
         .log
         .iter()
-        .rev()
-        .take(rows)
-        .rev()
+        .skip(start)
+        .take(end - start)
         .map(|l| {
             ListItem::new(Line::from(vec![
-                Span::styled(format!("{} ", l.ts), Style::default().fg(Color::DarkGray)),
-                Span::styled(l.text.clone(), Style::default().fg(l.color)),
+                Span::styled(
+                    format!("{} ", l.ts),
+                    Style::default().fg(t.c(Color::DarkGray)),
+                ),
+                Span::styled(l.text.clone(), Style::default().fg(t.c(l.color))),
             ]))
         })
         .collect();
     f.render_widget(List::new(items).block(block), area);
+    if total > rows {
+        let mut sb = ScrollbarState::new(total.saturating_sub(rows)).position(start);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None),
+            area,
+            &mut sb,
+        );
+    }
 }
 
 fn draw_keybar(f: &mut Frame, area: Rect, app: &App) {
-    let key = |k: &str, d: &str| {
+    let t = &app.theme;
+    let key = move |k: &str, d: &str| {
         vec![
-            Span::styled(
-                format!(" {k} "),
-                Style::default().bg(Color::DarkGray).fg(Color::White),
-            ),
-            Span::styled(format!(" {d}  "), Style::default().fg(Color::Gray)),
+            Span::styled(format!(" {k} "), t.badge(Color::Gray)),
+            Span::styled(format!(" {d}  "), Style::default().fg(t.c(Color::Gray))),
         ]
     };
     let mut spans = Vec::new();
     spans.extend(key("q", "quit"));
     spans.extend(key("space", if app.paused { "resume" } else { "pause" }));
-    spans.extend(key("r", "reset peaks"));
+    spans.extend(key("1-5", "zoom"));
+    spans.extend(key("↑↓", "log"));
     spans.extend(key("+/-", "rate"));
     if app.cards.len() > 1 {
         spans.extend(key("tab", "card"));
@@ -704,9 +900,10 @@ fn draw_keybar(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Line::from(spans), area);
 }
 
-fn draw_help(f: &mut Frame, area: Rect) {
-    let w = 56.min(area.width.saturating_sub(4));
-    let h = 16.min(area.height.saturating_sub(2));
+fn draw_help(f: &mut Frame, area: Rect, app: &App) {
+    let t = &app.theme;
+    let w = 58.min(area.width.saturating_sub(4));
+    let h = 18.min(area.height.saturating_sub(2));
     let [v] = Layout::vertical([Constraint::Length(h)])
         .flex(Flex::Center)
         .areas(area);
@@ -714,35 +911,44 @@ fn draw_help(f: &mut Frame, area: Rect) {
         .flex(Flex::Center)
         .areas(v);
     f.render_widget(Clear, popup);
+    let dim = Style::default().fg(t.c(Color::Gray));
     let lines = vec![
-        Line::from("astral-watch — live dashboard".bold()),
+        Line::from(Span::styled(
+            "astral-watch — live dashboard",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
         Line::from(""),
         Line::from("  q / Ctrl-C   quit (from anywhere)"),
         Line::from("  space        pause / resume sampling"),
         Line::from("  r            reset session peaks"),
         Line::from("  + / -        faster / slower sample rate"),
+        Line::from("  1 - 5        zoom a panel · 0 / Esc back"),
+        Line::from("  ↑ / ↓ wheel  scroll the alert log"),
         Line::from("  Tab / ← →    switch GPU (multi-card)"),
         Line::from("  ? / Esc      toggle / close this help"),
         Line::from(""),
         Line::from(vec![
             Span::raw("  thresholds:  overload "),
-            Span::styled(format!("{OVERLOAD_A}A"), Style::default().fg(Color::Red)),
+            Span::styled(
+                format!("{OVERLOAD_A}A"),
+                Style::default().fg(t.c(Color::Red)),
+            ),
             Span::raw(format!("/pin · imbalance {IMBALANCE_RATIO}×")),
         ]),
-        Line::from(
-            format!("               (alarms gate above {MIN_LOAD_A}A total)").fg(Color::Gray),
-        ),
+        Line::from(Span::styled(
+            format!("               (alarms gate above {MIN_LOAD_A}A total)"),
+            dim,
+        )),
         Line::from(""),
-        Line::from("  divergence in the trend chart is the".fg(Color::Gray)),
-        Line::from("  early melt signal — watch for a pin".fg(Color::Gray)),
-        Line::from("  drifting away from the pack.".fg(Color::Gray)),
+        Line::from(Span::styled(
+            "  watch the trend chart for a pin drifting",
+            dim,
+        )),
+        Line::from(Span::styled("  away from the pack — the melt tell.", dim)),
     ];
     f.render_widget(
-        Paragraph::new(lines).block(
-            Block::bordered()
-                .title(" help ")
-                .border_style(Style::default().fg(Color::Cyan)),
-        ),
+        Paragraph::new(lines)
+            .block(panel(t, " help ").border_style(Style::default().fg(t.c(Color::Cyan)))),
         popup,
     );
 }
@@ -769,6 +975,7 @@ mod tests {
             selected: 0,
             auto: true,
             metrics: None,
+            theme: Theme { color: true },
             reading: Some(Reading {
                 pins: amps.map(|x| Pin {
                     volts: 11.97,
@@ -780,13 +987,14 @@ mod tests {
             active: Vec::new(),
             pin_hist: std::array::from_fn(|_| VecDeque::new()),
             pin_peak: [0.0; PIN_COUNT],
-            balance_hist: VecDeque::new(),
             watts_hist: VecDeque::new(),
             peak_watts: 0.0,
             peak_balance: 0.0,
             log: VecDeque::new(),
+            log_scroll: 0,
             paused: false,
             show_help: false,
+            focus: None,
             interval: Duration::from_secs(1),
             misses: 0,
             samples: 3,
@@ -815,7 +1023,15 @@ mod tests {
         assert!(s.contains("per-pin") && s.contains("trend"));
         assert!(s.contains("balance") && s.contains("watts") && s.contains("totals"));
         assert!(s.contains("alert log"));
-        assert!(s.contains("quit") && s.contains("pause")); // keybar
+        assert!(s.contains("quit") && s.contains("zoom"));
+    }
+
+    #[test]
+    fn bars_show_limit_line_and_values() {
+        let s = screen(&app([8.2, 8.6, 8.3, 8.4, 8.5, 8.8]), 130, 40);
+        assert!(s.contains('┄'), "9.2A limit line drawn");
+        assert!(s.contains('█'), "bar fill drawn");
+        assert!(s.contains("p1") && s.contains("p6"), "pin labels");
     }
 
     #[test]
@@ -827,13 +1043,22 @@ mod tests {
     }
 
     #[test]
+    fn focus_zooms_a_single_panel() {
+        let mut a = app([8.0; 6]);
+        a.focus = Some(1); // trend
+        let s = screen(&a, 130, 40);
+        assert!(s.contains("trend") && s.contains("[trend]"));
+        assert!(!s.contains("alert log"), "other panels hidden when zoomed");
+    }
+
+    #[test]
     fn paused_and_help_render() {
         let mut a = app([8.0; 6]);
         a.paused = true;
         assert!(screen(&a, 130, 40).contains("PAUSED"));
         a.show_help = true;
         let s = screen(&a, 130, 40);
-        assert!(s.contains("help") && s.contains("switch GPU"));
+        assert!(s.contains("help") && s.contains("switch GPU") && s.contains("zoom a panel"));
     }
 
     #[test]
@@ -845,25 +1070,33 @@ mod tests {
             model: "ROG Astral RTX 5080".into(),
         });
         let s = screen(&a, 130, 40);
-        assert!(
-            s.contains("5090") && s.contains("5080"),
-            "both card tabs: {s}"
-        );
-        assert!(s.contains("card")); // keybar gains the card hint
+        assert!(s.contains("5090") && s.contains("5080"));
+        assert!(s.contains("card"));
+    }
+
+    #[test]
+    fn no_color_theme_renders() {
+        let mut a = app([8.0; 6]);
+        a.theme = Theme { color: false };
+        let s = screen(&a, 130, 40);
+        assert!(s.contains("astral-watch") && s.contains('█'));
     }
 
     #[test]
     fn keys_drive_state() {
         let mut a = app([8.0; 6]);
-        assert!(!a.paused);
         a.on_key(KeyCode::Char(' '), KeyModifiers::NONE);
         assert!(a.paused);
+        a.on_key(KeyCode::Char('2'), KeyModifiers::NONE);
+        assert_eq!(a.focus, Some(1));
+        a.on_key(KeyCode::Esc, KeyModifiers::NONE); // Esc leaves zoom first (doesn't quit)
+        assert_eq!(a.focus, None);
         a.on_key(KeyCode::Char('?'), KeyModifiers::NONE);
         assert!(a.show_help);
-        a.on_key(KeyCode::Char('x'), KeyModifiers::NONE); // any key dismisses help
+        a.on_key(KeyCode::Char('x'), KeyModifiers::NONE);
         assert!(!a.show_help);
-        assert!(a.on_key(KeyCode::Char('q'), KeyModifiers::NONE)); // quit
-        assert!(a.on_key(KeyCode::Char('c'), KeyModifiers::CONTROL)); // ctrl-c quit
+        assert!(a.on_key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(a.on_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
     }
 
     #[test]
@@ -874,29 +1107,53 @@ mod tests {
     }
 
     #[test]
+    fn log_scroll_clamps() {
+        let mut a = app([8.0; 6]);
+        for i in 0..50 {
+            a.push_log(format!("line {i}"), Color::Gray);
+        }
+        a.scroll_log(-5); // can't scroll below 0
+        assert_eq!(a.log_scroll, 0);
+        a.scroll_log(1000); // clamps to len-1
+        assert_eq!(a.log_scroll, a.log.len() - 1);
+    }
+
+    #[test]
     fn rate_keys_clamp() {
         let mut a = app([8.0; 6]);
-        for _ in 0..10 {
+        for _ in 0..12 {
             a.on_key(KeyCode::Char('+'), KeyModifiers::NONE);
         }
         assert!(a.interval >= MIN_INTERVAL);
-        for _ in 0..10 {
+        for _ in 0..12 {
             a.on_key(KeyCode::Char('-'), KeyModifiers::NONE);
         }
         assert!(a.interval <= MAX_INTERVAL);
     }
 
     #[test]
-    fn tiny_terminal_does_not_panic() {
-        let a = app([8.0; 6]);
-        for (w, h) in [(130, 40), (80, 24), (40, 10), (20, 6), (1, 1)] {
-            let _ = screen(&a, w, h);
+    fn extreme_sizes_do_not_panic() {
+        let mut a = app([9.9, 0.0, 8.0, 8.0, 8.0, 8.0]);
+        a.active = vec![Condition::Overload];
+        for f in [None, Some(0), Some(1), Some(4)] {
+            a.focus = f;
+            for (w, h) in [
+                (130, 40),
+                (80, 24),
+                (40, 10),
+                (12, 5),
+                (6, 4),
+                (3, 3),
+                (1, 1),
+                (200, 80),
+            ] {
+                let _ = screen(&a, w, h);
+            }
         }
     }
 
     #[test]
     fn empty_history_does_not_panic() {
-        // startup state: no reading yet, empty history feeding the trend chart / sparklines
         let mut a = app([8.0; 6]);
         a.clear_history();
         for (w, h) in [(130, 40), (80, 24), (1, 1)] {

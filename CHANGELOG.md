@@ -8,10 +8,14 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 ## [Unreleased]
 
 ### Changed
-- **TUI overhaul** — the `tui` dashboard gained a per-pin divergence trend chart, session
-  peak-hold on the bars, a balance gauge, an alert event log, multi-GPU tabs, a full-width
-  alarm banner, a responsive layout, and a key map (pause, reset peaks, live sample rate,
-  card switch, help overlay) with a persistent keybind bar.
+- **TUI overhaul** — the `tui` dashboard went from a basic single screen to a full one:
+  a per-pin **current bar chart** with a 9.2 A limit line and session peak caps, a per-pin
+  **divergence trend chart**, a balance gauge, a watts sparkline, and a **scrollable** alert
+  event log; multi-GPU **tabs**; a full-width alarm banner; **panel zoom** (`1`-`5`); a
+  responsive layout; and a key map (pause, reset peaks, live sample rate, card switch, log
+  scroll, help) plus mouse-wheel scroll and a persistent keybind bar. Styling is
+  **terminal-theme-respecting** — reverse-video emphasis instead of hardcoded backgrounds,
+  rounded borders, and `NO_COLOR` support — so it reads on light and dark terminals.
 
 ## [0.4.0] - 2026-06-16
 
