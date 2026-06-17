@@ -184,7 +184,8 @@ impl App {
             color,
         });
         if self.log_scroll > 0 {
-            self.log_scroll += 1; // keep the viewport anchored while scrolled back
+            // keep the viewport anchored while scrolled back, but bounded
+            self.log_scroll = (self.log_scroll + 1).min(self.log.len().saturating_sub(1));
         }
     }
 
@@ -359,6 +360,12 @@ pub fn run_tui(
 
     let mut terminal = ratatui::init();
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    // ratatui's panic hook restores the screen but not mouse mode — chain ours ahead of it
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        prev_hook(info);
+    }));
     let res = (|| -> Result<()> {
         let mut next_sample = Instant::now();
         loop {
@@ -848,8 +855,11 @@ fn draw_log(f: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     let rows = inner.height as usize;
     let total = app.log.len();
-    // newest at the bottom; log_scroll lines back from the end
-    let end = total.saturating_sub(app.log_scroll);
+    // newest at the bottom; scroll back at most `total - rows` so the window never shrinks
+    // below a full page or blanks out
+    let max_scroll = total.saturating_sub(rows);
+    let s = app.log_scroll.min(max_scroll);
+    let end = total - s;
     let start = end.saturating_sub(rows);
     let items: Vec<ListItem> = app
         .log
@@ -1116,6 +1126,39 @@ mod tests {
         assert_eq!(a.log_scroll, 0);
         a.scroll_log(1000); // clamps to len-1
         assert_eq!(a.log_scroll, a.log.len() - 1);
+    }
+
+    #[test]
+    fn scrolled_log_keeps_a_full_window() {
+        let mut a = app([8.0; 6]);
+        for i in 0..60 {
+            a.push_log(format!("evt{i}"), Color::Gray);
+        }
+        a.log_scroll = 10_000; // mash scroll-up far past the top
+        let s = screen(&a, 130, 40);
+        // must not shrink to one line, and must reach the oldest entries
+        assert!(
+            s.matches("evt").count() >= 5,
+            "scrolled log should still fill the pane"
+        );
+        assert!(s.contains("evt0"), "oldest line visible at the top");
+    }
+
+    #[test]
+    fn streaming_past_cap_while_scrolled_does_not_blank() {
+        let mut a = app([8.0; 6]);
+        for i in 0..20 {
+            a.push_log(format!("evt{i}"), Color::Gray);
+        }
+        a.scroll_log(6);
+        for i in 20..300 {
+            a.push_log(format!("evt{i}"), Color::Gray); // exceeds LOG_CAP
+        }
+        let s = screen(&a, 130, 40);
+        assert!(
+            s.matches("evt").count() >= 5,
+            "log must not blank when streaming past cap"
+        );
     }
 
     #[test]
