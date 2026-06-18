@@ -60,7 +60,7 @@ jobs:
           go-version: stable
       - uses: Swatinem/rust-cache@v2
       - name: Install nfpm
-        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.46.3
       - name: Build (native gnu, default features)
         run: cargo build --release --locked
       - name: Stage via make install

@@ -8,7 +8,7 @@ description = "Per-pin 12V-2x6 power monitoring and connector-melt protection fo
 repository = "https://github.com/mbeaman/astral-watch"
 homepage = "https://github.com/mbeaman/astral-watch"
 readme = "README.md"
-exclude = [".github/"]
+exclude = [".github/", "flake.nix", "nix/"]
 keywords = ["gpu", "nvidia", "asus", "12vhpwr", "monitoring"]
 categories = ["command-line-utilities"]
 
