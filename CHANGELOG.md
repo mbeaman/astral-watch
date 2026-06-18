@@ -5,6 +5,17 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Distro packages** — `.deb` + `.rpm` (built with nfpm from the `make install` tree, so the
+  file layout has one source of truth) and a Nix **flake** + **NixOS module**. The release
+  workflow publishes the `.deb`/`.rpm` (with checksums) alongside the tarballs; `nix run
+  github:mbeaman/astral-watch` works from the flake. All are the lean read-only build (the
+  opt-in safety daemon is not packaged). Packages install the service **disabled** (with an
+  `enable --now` hint), keep `/etc/astral-watch.toml` as a conffile, and create the
+  user/group via `systemd-sysusers`. CI gained a packaging-build job and a `nix flake check`.
+
 ## [0.6.0] - 2026-06-18
 
 ### Added
@@ -148,6 +159,7 @@ Initial release: per-pin 12V-2x6 telemetry (ITE IT8915FN over `/dev/i2c-*`), liv
 auto-rotating CSV logging with falloff capture, overload/disconnect/imbalance alerts,
 hardened systemd service + udev rule, read-only safety design (`docs/SAFETY.md`).
 
+[Unreleased]: https://github.com/mbeaman/astral-watch/compare/v0.6.0...HEAD
 [0.6.0]: https://github.com/mbeaman/astral-watch/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/mbeaman/astral-watch/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/mbeaman/astral-watch/compare/v0.3.1...v0.4.0

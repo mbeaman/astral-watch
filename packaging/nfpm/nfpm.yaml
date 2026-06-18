@@ -1,0 +1,107 @@
+# nfpm config — produces BOTH the Fedora .rpm and Debian .deb release artifacts from
+# the tree that `make install DESTDIR=stage PREFIX=/usr` already produced. This reuses
+# the project's install logic verbatim (constraint 1): nfpm only packages the staged
+# files + runs the shared scriptlets; it does not re-derive the file list.
+#
+# Build the stage first (lean, read-only, GNU target — no nvml/ratatui):
+#   cargo build --release --locked            # default features only
+#   make install DESTDIR="$PWD/stage" PREFIX=/usr   # or: make install-files (if already built)
+# then:
+#   nfpm pkg --config packaging/nfpm/nfpm.yaml --packager rpm --target dist/
+#   nfpm pkg --config packaging/nfpm/nfpm.yaml --packager deb --target dist/
+
+name: astral-watch
+arch: amd64                     # nfpm maps amd64 -> x86_64 (rpm) / amd64 (deb)
+platform: linux
+version: ${VERSION}             # pass -e or env VERSION=0.6.0 (no leading v)
+version_schema: semver
+release: "1"
+section: utils
+priority: optional
+maintainer: Matt Beaman <matthew.a.beaman@gmail.com>
+description: |
+  Per-pin 12V-2x6 power monitoring and connector-melt early-warning for
+  ASUS ROG Astral GPUs on Linux. Reads GPU telemetry over i2c and alerts
+  on per-pin overload, current imbalance, and disconnected pins.
+vendor: Matt Beaman
+homepage: https://github.com/mbeaman/astral-watch
+license: MIT
+
+# nfpm does NOT auto-scan the ELF for shared-library Requires (unlike rpmbuild).
+# Declare runtime deps explicitly. Rust links libgcc_s for unwinding; the scriptlets
+# need systemd-sysusers / systemctl / udevadm.
+depends:
+  - systemd                     # provides systemd-sysusers, systemctl, udevadm
+overrides:
+  rpm:
+    depends:
+      - glibc
+      - libgcc                  # libgcc_s.so.1
+      - systemd
+  deb:
+    depends:
+      - libc6
+      - libgcc-s1
+      - systemd
+
+contents:
+  # Pull every file straight from the staged tree so the package mirrors `make install`.
+  - src: stage/usr/bin/astral-watch
+    dst: /usr/bin/astral-watch
+    file_info: { mode: 0755 }
+
+  - src: stage/usr/lib/udev/rules.d/99-astral-watch.rules
+    dst: /usr/lib/udev/rules.d/99-astral-watch.rules
+    file_info: { mode: 0644 }
+
+  - src: stage/usr/lib/sysusers.d/astral-watch.conf
+    dst: /usr/lib/sysusers.d/astral-watch.conf
+    file_info: { mode: 0644 }
+
+  - src: stage/usr/lib/modules-load.d/astral-watch.conf
+    dst: /usr/lib/modules-load.d/astral-watch.conf
+    file_info: { mode: 0644 }
+
+  - src: stage/usr/lib/systemd/system/astral-watch.service
+    dst: /usr/lib/systemd/system/astral-watch.service
+    file_info: { mode: 0644 }
+
+  # The config file: %config(noreplace) on rpm / dpkg conffile on deb — never clobber
+  # user edits on upgrade (constraint 4).
+  - src: stage/etc/astral-watch.toml
+    dst: /etc/astral-watch.toml
+    type: "config|noreplace"
+    file_info: { mode: 0644 }
+
+  # Docs / license (not config).
+  - src: LICENSE
+    dst: /usr/share/licenses/astral-watch/LICENSE
+    file_info: { mode: 0644 }
+    packager: rpm               # deb convention is /usr/share/doc/<pkg>/copyright
+  - src: LICENSE
+    dst: /usr/share/doc/astral-watch/copyright
+    file_info: { mode: 0644 }
+    packager: deb
+  - src: docs/grafana-dashboard.json
+    dst: /usr/share/doc/astral-watch/grafana-dashboard.json
+    file_info: { mode: 0644 }
+  - src: docs/SAFETY.md
+    dst: /usr/share/doc/astral-watch/SAFETY.md
+    file_info: { mode: 0644 }
+
+scripts:
+  postinstall: packaging/nfpm/postinstall.sh
+  preremove: packaging/nfpm/preremove.sh
+  postremove: packaging/nfpm/postremove.sh
+
+rpm:
+  # Avoids the rpmlint "no-changelog" being a hard issue and gives a real entry.
+  # Optional: drop if you wire CHANGELOG.md in instead.
+  group: Applications/System
+  # signature.key_file: set in CI to GPG-sign the rpm for the release page (optional).
+
+# NOTE: the privileged NVML power-cap unit (astral-watch-safety.service) is
+# DELIBERATELY NOT PACKAGED. The default release rpm is the lean read-only build
+# with no `safety` feature, so the binary cannot run that unit. This is how
+# constraint 3 ("safety unit must NEVER be auto-enabled") is satisfied — by absence.
+# A safety-capable package would be a separate feature build, out of scope here.

@@ -46,10 +46,43 @@ jobs:
             astral-watch-*.tar.gz.sha256
           if-no-files-found: error
 
+  # .deb + .rpm from one nfpm config, packaging the `make install` tree (one source of truth
+  # for the file layout). Native build (no --target) so make install-files finds the binary
+  # at target/release/. The default lean read-only build — the safety unit is not packaged.
+  packages:
+    name: deb + rpm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install nfpm
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+      - name: Build (native gnu, default features)
+        run: cargo build --release --locked
+      - name: Stage via make install
+        run: make install DESTDIR="$PWD/stage" PREFIX=/usr
+      - name: Package .deb and .rpm
+        run: |
+          export VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          nfpm package -f packaging/nfpm/nfpm.yaml -p deb -t dist/
+          nfpm package -f packaging/nfpm/nfpm.yaml -p rpm -t dist/
+          ( cd dist && for f in *.deb *.rpm; do sha256sum "$f" > "$f.sha256"; done )
+          ls -l dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: dist/*
+          if-no-files-found: error
+
   # publish atomically, only after every target built — a failed leg must never leave a
   # public half-empty release on the tag
   release:
-    needs: build
+    needs: [build, packages]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -63,8 +96,13 @@ jobs:
           files: |
             astral-watch-*.tar.gz
             astral-watch-*.tar.gz.sha256
+            astral-watch*.deb
+            astral-watch*.rpm
+            astral-watch*.deb.sha256
+            astral-watch*.rpm.sha256
           body: >
-            Prebuilt Linux binaries (gnu and static musl). See
+            Prebuilt Linux binaries (gnu and static musl) plus `.deb` and `.rpm` packages. See
             [CHANGELOG.md](https://github.com/mbeaman/astral-watch/blob/main/CHANGELOG.md)
-            for what changed. For the udev rule + systemd service, run `sudo make install`
-            from a source checkout, or use the AUR package.
+            for what changed. Debian/Ubuntu: `sudo apt install ./astral-watch_*.deb`; Fedora:
+            `sudo dnf install ./astral-watch-*.rpm`; Arch: the AUR package; Nix:
+            `nix run github:mbeaman/astral-watch`. From source: `sudo make install`.

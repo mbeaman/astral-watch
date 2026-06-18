@@ -87,8 +87,29 @@ sudo systemctl enable --now astral-watch
 ```
 
 It logs to `/var/log/astral-watch/gpu-pins.csv` and reads `/etc/astral-watch.toml` (a commented
-example is installed there — see [Configuration](#configuration)). On Arch, use the
-[AUR `PKGBUILD`](packaging/aur/) instead of `make install`.
+example is installed there — see [Configuration](#configuration)).
+
+### Distro packages
+
+Prebuilt `.deb` and `.rpm` (and `.tar.gz`) are attached to each
+[release](https://github.com/mbeaman/astral-watch/releases); all ship the udev rule, systemd
+unit, and config, and install the service **disabled** (enable it with `systemctl enable --now
+astral-watch`):
+
+```sh
+# Debian / Ubuntu
+sudo apt install ./astral-watch_*.deb
+# Fedora / RHEL
+sudo dnf install ./astral-watch-*.rpm
+# Arch (AUR)
+git clone https://aur.archlinux.org/astral-watch.git && cd astral-watch && makepkg -si
+# Nix (run without installing)
+nix run github:mbeaman/astral-watch
+#   NixOS: import the flake's nixosModules.default, then services.astral-watch.enable = true;
+```
+
+These are the lean **read-only** build; the opt-in NVML safety daemon is a separate
+feature build (`make install-safety`) — see [`docs/SAFETY.md`](docs/SAFETY.md).
 
 ### Run it yourself without sudo
 
@@ -176,11 +197,13 @@ invariants are in [`docs/SAFETY.md`](docs/SAFETY.md).
   release infrastructure — prebuilt binaries, AUR `PKGBUILD`, crates.io packaging. ✓
 - **0.4:** opt-in TUI, GPU identity correlation, graceful-shutdown notification flush,
   card-pinned bus re-detection. ✓
-- **0.5 (here):** full TUI dashboard — per-pin bars + divergence trend chart, nvtop-style
+- **0.5:** full TUI dashboard — per-pin bars + divergence trend chart, nvtop-style
   device header (PCIe link, GPU/power/temp via best-effort nvidia-smi), zoned balance gauge,
-  alert log, multi-GPU tabs, panel zoom, theming.
+  alert log, multi-GPU tabs, panel zoom, theming. ✓
 - **0.6:** opt-in **NVML safety daemon** — auto power-cap on sustained overload
   (separate privileged unit, off by default, latched + fail-safe, never raises the limit). ✓
+- **0.7 (here):** distro reach — `.deb` + `.rpm` (nfpm) and a Nix flake + NixOS module,
+  published on the releases page; all driven from `make install` (one source of truth).
 - **later:** high-rate event-capture ring buffer.
 
 ## Credits

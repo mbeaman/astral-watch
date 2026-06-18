@@ -121,3 +121,45 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  linux-packages:
+    name: deb + rpm build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install nfpm
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+      # native build (no --target) so make install-files finds target/release/astral-watch
+      - run: cargo build --release --locked
+      - run: make install DESTDIR="$PWD/stage" PREFIX=/usr
+      - name: Build packages (so the nfpm config + scriptlets can't rot)
+        run: |
+          export VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          mkdir -p dist
+          nfpm package -f packaging/nfpm/nfpm.yaml -p deb -t dist/
+          nfpm package -f packaging/nfpm/nfpm.yaml -p rpm -t dist/
+      - name: Inspect the .deb (contents + the conffile + deps)
+        run: |
+          deb=$(ls dist/*.deb); echo "== $deb =="
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb"
+          dpkg-deb --info "$deb" | grep -q 'Depends:.*libgcc-s1' || { echo "missing libgcc-s1 dep"; exit 1; }
+          dpkg-deb --contents "$deb" | grep -q 'usr/bin/astral-watch'
+          dpkg-deb --contents "$deb" | grep -q 'usr/lib/systemd/system/astral-watch.service'
+          # the privileged safety unit must NOT be in the default package
+          ! dpkg-deb --contents "$deb" | grep -q 'astral-watch-safety.service'
+          test -s dist/*.rpm
+
+  nix:
+    name: nix flake
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: DeterminateSystems/nix-installer-action@main
+      # evaluate the flake + nixos module (catches eval/option errors) without the full build
+      - run: nix flake check --no-build
