@@ -203,7 +203,13 @@ mod tests {
             "drip client held the handler for {held_for:?}"
         );
         let response = dripper.join().unwrap();
-        assert!(response.contains("408"), "expected 408, got: {response}");
+        // the handler either FINs with the 408 body or, on a loaded runner, RSTs the socket
+        // (unread drip bytes still in the recv buffer) so the client loses the body — both prove
+        // the deadline dropped the slow client; held_for < 4s above already proved it fired
+        assert!(
+            response.is_empty() || response.contains("408"),
+            "expected a 408 or a dropped connection, got: {response}"
+        );
     }
 
     #[test]
