@@ -47,11 +47,14 @@ use std::time::{Duration, Instant};
 const STATE_DIR: &str = "/run/astral-watch-safety";
 const STATE_FILE: &str = "/run/astral-watch-safety/cap-state.json";
 
-/// A pin physically can't carry this many amps before failing — a reading above it is a torn
-/// i2c read, not a real overload. A separate, stricter gate than [`Reading::plausible`] (which
-/// only checks voltage) because the daemon *acts* on the value, with no human in the loop.
-const MAX_PIN_AMPS: f64 = 20.0;
-const MAX_TOTAL_AMPS: f64 = 100.0;
+/// Reject only a torn/garbage read — a pin at/near the 16-bit current saturation (~65.535A) or
+/// an absurd total — NOT a genuine concentrated overload. A lost contact can leave a surviving
+/// pin carrying ~22-25A; that is the daemon's highest-priority case and MUST reach `evaluate`, so
+/// the ceiling sits just below the saturation artifact, well above the connector's nominal
+/// rating. (The tear-resistant read bounds residual artifacts to ~±0.26A, so a stable 25A reads
+/// 25A — only the full-corruption ~65.535A sentinel is filtered here.)
+const MAX_PIN_AMPS: f64 = 60.0;
+const MAX_TOTAL_AMPS: f64 = 200.0;
 
 /// Tolerance (mW) when comparing the in-effect limit to what we set — NVML may round, and
 /// another power-limit manager changing it by more than this means "someone else took over".
@@ -293,7 +296,9 @@ fn try_engage(
     };
     match params.decide(cur) {
         CapDecision::Apply(target) => match set_and_confirm(&guard.nvml, &guard.pci, target) {
-            Ok(readback) if within(readback, target, LIMIT_TOL_MW) => {
+            // success only if the limit actually took AND is a real reduction (NVML rounding near
+            // an exhausted lever must never be recorded as a "cap" that didn't lower power)
+            Ok(readback) if within(readback, target, LIMIT_TOL_MW) && readback < cur => {
                 guard.original_mw = cur;
                 guard.capped_mw = readback;
                 guard.engaged = true;
@@ -629,14 +634,19 @@ mod tests {
     }
 
     #[test]
-    fn current_plausibility_rejects_torn_reads() {
+    fn current_plausibility_passes_real_overloads_rejects_garbage() {
         assert!(current_plausible(&reading([8.2, 8.6, 8.3, 8.4, 8.5, 8.8])));
-        // a single pin pinned at the 16-bit max (65.535A) is a torn read, not an overload
+        // CONCENTRATED overload — a lost contact leaving two survivors at ~25A each — is the
+        // daemon's most important case; it MUST pass the gate so evaluate() can trigger a cap
+        assert!(current_plausible(&reading([
+            25.0, 25.0, 0.0, 0.0, 0.0, 0.0
+        ])));
+        // a pin pinned near the 16-bit current saturation (65.535A) is a torn read, not real
         let mut torn = [8.0; 6];
         torn[2] = 65.535;
         assert!(!current_plausible(&reading(torn)));
-        // total over the connector's physical ceiling
-        assert!(!current_plausible(&reading([19.0; 6])));
+        // all-pins-garbage (absurd total) rejected
+        assert!(!current_plausible(&reading([65.0; 6])));
     }
 
     #[test]

@@ -1387,7 +1387,7 @@ mod tests {
     fn device_header_shows_gpu_stats_when_present() {
         let mut a = app([8.0; 6]);
         a.gpu = Some(Arc::new(Mutex::new(vec![GpuStat {
-            pci: "0b:00.0".into(), // normalized to match card 0000:0b:00.0
+            pci: "00000000:0b:00.0".into(), // normalized to match card 0000:0b:00.0
             util: Some(100),
             draw_w: Some(320.0),
             limit_w: Some(600.0),
@@ -1416,7 +1416,7 @@ mod tests {
     fn parse_gpu_csv_handles_na() {
         let v = parse_gpu_csv("00000000:0B:00.0, 100, 320.36, 600.00, 69, [N/A]\n");
         assert_eq!(v.len(), 1);
-        assert_eq!(v[0].pci, "0b:00.0");
+        assert_eq!(v[0].pci, "00000000:0b:00.0");
         assert_eq!(v[0].util, Some(100));
         assert_eq!(v[0].limit_w, Some(600.0));
         assert_eq!(v[0].fan, None); // [N/A] -> None, not a parse panic

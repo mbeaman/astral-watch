@@ -33,13 +33,11 @@ ProtectKernelTunables=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 DevicePolicy=closed
 DeviceAllow=char-i2c rw
-# NVIDIA control nodes — there is no `char-nvidia` device class, so allow the specific nodes
-DeviceAllow=/dev/nvidiactl rw
+# NVIDIA nodes by device class: major 195 is registered as `nvidia` in /proc/devices and covers
+# /dev/nvidia0..N and /dev/nvidiactl, so this works regardless of how many GPUs enumerate.
+DeviceAllow=char-nvidia rw
+# nvidia-uvm is a separate major, not covered by char-nvidia
 DeviceAllow=/dev/nvidia-uvm rw
-DeviceAllow=/dev/nvidia0 rw
-DeviceAllow=/dev/nvidia1 rw
-DeviceAllow=/dev/nvidia2 rw
-DeviceAllow=/dev/nvidia3 rw
 
 [Install]
 WantedBy=multi-user.target

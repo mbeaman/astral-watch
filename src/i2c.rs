@@ -195,12 +195,18 @@ fn pci_id_from_path(path: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Normalize a PCI id for cross-source matching: lowercase, drop the domain — so the sysfs
-/// form (`0000:0b:00.0`) and the NVML / nvidia-smi form (`00000000:0B:00.0`) compare equal.
+/// Normalize a PCI id for cross-source matching. The sysfs form (`0000:0b:00.0`) and the NVML /
+/// nvidia-smi form (`00000000:0B:00.0`) differ only in domain width and hex case, so canonicalize
+/// to a fixed 8-hex lowercase domain plus the rest. This keeps the two forms equal while still
+/// distinguishing GPUs that share a `bus:device.function` across different PCI domains (so the
+/// safety daemon never caps a same-BDF sibling in another domain).
 pub fn norm_pci(s: &str) -> String {
     let lower = s.trim().to_ascii_lowercase();
     match lower.split_once(':') {
-        Some((_, rest)) => rest.to_string(), // drop the domain
+        Some((dom, rest)) => match u32::from_str_radix(dom, 16) {
+            Ok(d) => format!("{d:08x}:{rest}"),
+            Err(_) => lower, // unexpected form — compare it whole rather than guess
+        },
         None => lower,
     }
 }
@@ -317,6 +323,15 @@ mod tests {
         assert!(!is_pci_bdf("pci0000:00"));
         assert!(!is_pci_bdf("0000:0b:00.")); // wrong length
         assert!(!is_pci_bdf("zzzz:0b:00.0")); // non-hex
+    }
+
+    #[test]
+    fn norm_pci_reconciles_domain_width_but_keeps_domains_distinct() {
+        // sysfs (4-hex) and NVML/nvidia-smi (8-hex, upper) forms of the same card match
+        assert_eq!(norm_pci("0000:0b:00.0"), norm_pci("00000000:0B:00.0"));
+        // but a same-bus:device.function card in a *different* PCI domain must NOT collide
+        assert_ne!(norm_pci("0000:0b:00.0"), norm_pci("0001:0b:00.0"));
+        assert_eq!(norm_pci("0000:0b:00.0"), "00000000:0b:00.0");
     }
 
     #[test]
