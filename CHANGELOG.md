@@ -5,7 +5,7 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.0] - 2026-06-18
 
 ### Added
 - **Opt-in NVML safety daemon** (`--features safety`, `astral-watch safety`) — the project's
@@ -148,7 +148,7 @@ Initial release: per-pin 12V-2x6 telemetry (ITE IT8915FN over `/dev/i2c-*`), liv
 auto-rotating CSV logging with falloff capture, overload/disconnect/imbalance alerts,
 hardened systemd service + udev rule, read-only safety design (`docs/SAFETY.md`).
 
-[Unreleased]: https://github.com/mbeaman/astral-watch/compare/v0.5.0...HEAD
+[0.6.0]: https://github.com/mbeaman/astral-watch/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/mbeaman/astral-watch/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/mbeaman/astral-watch/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/mbeaman/astral-watch/compare/v0.3.0...v0.3.1

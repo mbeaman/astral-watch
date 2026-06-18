@@ -179,8 +179,8 @@ invariants are in [`docs/SAFETY.md`](docs/SAFETY.md).
 - **0.5 (here):** full TUI dashboard — per-pin bars + divergence trend chart, nvtop-style
   device header (PCIe link, GPU/power/temp via best-effort nvidia-smi), zoned balance gauge,
   alert log, multi-GPU tabs, panel zoom, theming.
-- **0.6 (here):** opt-in **NVML safety daemon** — auto power-cap on sustained overload
-  (separate privileged unit, off by default, latched + fail-safe, never raises the limit).
+- **0.6:** opt-in **NVML safety daemon** — auto power-cap on sustained overload
+  (separate privileged unit, off by default, latched + fail-safe, never raises the limit). ✓
 - **later:** high-rate event-capture ring buffer.
 
 ## Credits
