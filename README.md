@@ -25,7 +25,7 @@ precedes a melted connector**.
   the i2c bus.
 - **Falloff capture** — writes a `GPU_UNREACHABLE` row the instant the GPU drops off the bus,
   so the per-pin state *right before* a crash is preserved.
-- **Read-only & safe** — only ever writes the i2c register pointer, never a data byte (see [Safety](#safety)).
+- **Read-only by default** — only ever writes the i2c register pointer, never a data byte; the one exception is the opt-in [safety daemon](#safety), off by default (see [Safety](#safety)).
 - Small, dependency-light single binary.
 
 ## Supported cards
@@ -157,10 +157,15 @@ read **byte-by-byte** (a single block read returns garbage on some SKUs).
 
 ## Safety
 
-This tool reads a chip on a live GPU's i2c bus. The access is **read-only**: a state-changing
+This tool is **read-only by default**. It reads a chip on a live GPU's i2c bus: a state-changing
 i2c write requires a data byte *after* the register pointer — `astral-watch` only ever writes the
 register pointer (`0x80…`) and then reads. It targets a single known address and never bus-scans.
-See [`docs/SAFETY.md`](docs/SAFETY.md).
+
+The one exception is the **opt-in safety daemon** (`cargo build --features safety` / `sudo make
+install-safety`, a separate disabled-by-default unit, armed only with `[safety] enabled = true`):
+on a sustained connector overload it reduces the GPU power limit via NVML — latched, fail-safe,
+and never *raising* the limit. The default build never touches NVML. Full details and the design
+invariants are in [`docs/SAFETY.md`](docs/SAFETY.md).
 
 ## Roadmap
 
@@ -174,8 +179,9 @@ See [`docs/SAFETY.md`](docs/SAFETY.md).
 - **0.5 (here):** full TUI dashboard — per-pin bars + divergence trend chart, nvtop-style
   device header (PCIe link, GPU/power/temp via best-effort nvidia-smi), zoned balance gauge,
   alert log, multi-GPU tabs, panel zoom, theming.
-- **later:** opt-in **safety daemon** (auto power-cap via NVML on sustained overload),
-  high-rate event-capture ring buffer.
+- **0.6 (here):** opt-in **NVML safety daemon** — auto power-cap on sustained overload
+  (separate privileged unit, off by default, latched + fail-safe, never raises the limit).
+- **later:** high-rate event-capture ring buffer.
 
 ## Credits
 

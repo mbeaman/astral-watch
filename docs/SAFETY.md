@@ -1,7 +1,12 @@
-# Safety: why this is a read-only operation
+# Safety: read-only by default
 
 `astral-watch` reads a sensor chip (ITE IT8915FN) that lives on a live GPU's i2c bus. This
 document explains why that access cannot change device state, and what precautions the tool takes.
+
+The default build and the shipped service are **strictly read-only**. There is exactly one
+exception — the [opt-in safety daemon](#opt-in-safety-daemon), a separately-built,
+separately-enabled, off-by-default component that can reduce the GPU power limit via NVML to
+slow a connector melt. It is documented in full below; nothing else ever writes GPU state.
 
 ## The access is read-only
 
@@ -64,8 +69,57 @@ exporter (`[export]` config or the `export` subcommand) is the one opt-in listen
 a read-only, unauthenticated `GET /metrics` from a cached snapshot — a scrape never touches
 the i2c bus — and defaults to loopback; bind it beyond loopback only on a network you trust.
 
-## What it does *not* do
+## What the default build does *not* do
 
-No writes, no power/clock/fan control, no NVML actions. A future opt-in safety daemon may cap GPU
-power on sustained overload — but that will act through the **NVIDIA driver (NVML)**, never via raw
-i2c writes.
+The default build and the shipped `astral-watch.service` are **strictly read-only**: no writes,
+no power/clock/fan control, no NVML. The one exception is the opt-in safety daemon below — a
+separate feature build and a separate, disabled-by-default unit.
+
+## Opt-in safety daemon
+
+Built only with `cargo build --features safety` (or `sudo make install-safety`), run as
+`astral-watch safety` (its own `astral-watch-safety.service`, shipped **disabled**), and armed
+only when `[safety] enabled = true`. It is astral-watch's only GPU-state mutation — and it acts
+through the **NVIDIA driver (NVML)**, never via raw i2c. On a confirmed, sustained overload (or a
+disconnected pin under load) it **reduces the GPU power limit**, pulling aggregate — and therefore
+per-pin — current down.
+
+Design invariants (chosen with an adversarial hardware-safety review):
+
+- **Triple opt-in, off by default.** A cargo `safety` feature + a unit shipped disabled +
+  `[safety] enabled = false`. The default install never gains NVML or the ability to write GPU
+  state. (Arming `enabled = true` on a non-`safety` build is refused loudly, never a silent no-op.)
+- **Privilege separation.** Setting the power limit requires root, so the safety unit runs
+  privileged — but it is a *separate* unit; the always-on monitor stays unprivileged and
+  read-only. The safety unit keeps every other systemd hardening directive.
+- **Latched.** One decisive cap, held until you run `astral-watch restore-power-limit` or reboot
+  (the NVML limit is volatile and resets on reboot/driver reload). It does **not** auto-restore
+  when the overload "clears" — the cap is *what cleared it*, so auto-restore would flap the limit
+  and report a false all-clear on a still-damaged connector. An engaged cap means a fault was
+  detected and the connector needs **physical inspection**.
+- **Never-raise.** It only ever *lowers* the limit. On an already-undervolted card where the safe
+  target sits above the current limit, it does nothing and loudly reports the lever is exhausted
+  (likely a true hardware fault).
+- **Fail-safe by direction.** On stop or crash it leaves the cap engaged (under-powered can never
+  melt a pin); a SIGKILL or reboot at worst leaves the card capped, which self-heals on reboot. A
+  same-boot restart adopts the live cap (state in `/run/astral-watch-safety/`) instead of
+  ratcheting the limit down. Restore is manual (`restore-power-limit`) or a reboot.
+- **Right GPU.** The capped device is matched to the monitored card by PCI id (never NVML index
+  0), and the limit is read back after setting to confirm it took; if it didn't, it alerts loudly
+  rather than believe the GPU is protected.
+- **Harm-minimization, not a cure.** A board-level cap lowers how much current the worst pin
+  carries, but cannot rebalance a single high-resistance / poorly-seated pin. If the alert
+  persists after a cap, the connector may still be failing — **inspect it physically**.
+
+Enabling it (after reading this section):
+
+```sh
+sudo make install-safety                 # builds the safety-capable binary + the disabled unit
+# arm it in /etc/astral-watch.toml:
+#   [safety]
+#   enabled = true
+#   # target_fraction = 0.5              # cap to 50% of the stock power limit (default)
+sudo systemctl enable --now astral-watch-safety
+```
+
+Undo a cap at any time with `sudo astral-watch restore-power-limit` (or reboot).

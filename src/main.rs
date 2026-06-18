@@ -79,6 +79,14 @@ enum Cmd {
     /// Full-screen live dashboard (built with `--features tui`)
     #[cfg(feature = "tui")]
     Tui,
+    /// Opt-in NVML auto power-cap daemon — caps GPU power on sustained overload (root; needs
+    /// `[safety] enabled = true`). The ONLY mode that mutates GPU state. Built with
+    /// `--features safety`.
+    #[cfg(feature = "safety")]
+    Safety,
+    /// Undo a power cap left by the safety daemon (restore the recorded original limit).
+    #[cfg(feature = "safety")]
+    RestorePowerLimit,
 }
 
 fn parse_u16(s: &str) -> Result<u16, String> {
@@ -116,6 +124,13 @@ fn main() -> Result<()> {
     for w in cfg.warnings() {
         eprintln!("# warning: {w}");
     }
+
+    // restore-power-limit is a one-shot that needs no bus/exporter — handle it before setup
+    #[cfg(feature = "safety")]
+    if matches!(cmd, Cmd::RestorePowerLimit) {
+        return astral_watch::safety::run_restore();
+    }
+
     let interval = parse_interval(cli.interval)?;
     if cli.interval < 0.05 {
         eprintln!(
@@ -150,6 +165,15 @@ fn main() -> Result<()> {
     let enabled = cfg.notify.enabled();
     if !enabled.is_empty() {
         eprintln!("# notify: {}", enabled.join(" + "));
+    }
+    // loud footgun guard: armed in config but this build can't act
+    #[cfg(not(feature = "safety"))]
+    if cfg.safety.enabled {
+        eprintln!(
+            "# warning: [safety] enabled = true but this build lacks the `safety` feature — NO \
+             power-cap protection is active. Run the `astral-watch safety` unit (built with \
+             --features safety)."
+        );
     }
 
     // The exporter binds before bus detection so scrapes see up=0 (not connection
@@ -228,6 +252,23 @@ fn main() -> Result<()> {
     if matches!(cmd, Cmd::Tui) {
         let r =
             astral_watch::tui::run_tui(bus, cli.addr, interval, &cfg, auto, &metrics, &shutdown);
+        dispatcher.shutdown(SHUTDOWN_GRACE);
+        return r;
+    }
+
+    // the safety daemon is its own sampling loop + its own NVML actuator; it caps GPU power on
+    // a sustained overload and flushes notifications on the way out
+    #[cfg(feature = "safety")]
+    if matches!(cmd, Cmd::Safety) {
+        let r = astral_watch::safety::run_safety(
+            bus,
+            cli.addr,
+            interval,
+            &cfg,
+            &dispatcher,
+            auto,
+            &shutdown,
+        );
         dispatcher.shutdown(SHUTDOWN_GRACE);
         return r;
     }

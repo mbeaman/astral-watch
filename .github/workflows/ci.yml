@@ -56,6 +56,20 @@ jobs:
       - run: cargo clippy --features tui --all-targets -- -D warnings
       - run: cargo test --features tui
 
+  safety:
+    name: safety feature
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # the opt-in NVML power-cap daemon; nvml-wrapper dlopens libnvidia-ml at runtime, so it
+      # builds and the (NVML-free) unit tests run on a driverless CI runner
+      - run: cargo clippy --features safety --all-targets -- -D warnings
+      - run: cargo test --features safety
+
   publish-dry-run:
     name: crates.io packaging
     runs-on: ubuntu-latest

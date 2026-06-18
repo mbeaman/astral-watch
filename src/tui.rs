@@ -20,7 +20,7 @@ use crate::alert::{evaluate, IMBALANCE_RATIO, MIN_LOAD_A, OVERLOAD_A};
 use crate::cards::gpu_at;
 use crate::config::Config;
 use crate::decode::{Reading, PIN_COUNT};
-use crate::i2c::{bus_pci_id, nvidia_buses, read_reading, redetect_card, REDETECT_AFTER};
+use crate::i2c::{bus_pci_id, norm_pci, nvidia_buses, read_reading, redetect_card, REDETECT_AFTER};
 use crate::lifecycle::{condition_of, Condition, Event, Lifecycle};
 use crate::metrics::Metrics;
 use anyhow::{bail, Result};
@@ -107,15 +107,6 @@ struct GpuStat {
     limit_w: Option<f64>,
     temp_c: Option<i32>,
     fan: Option<u8>,
-}
-
-/// Normalize a PCI id so sysfs (`0000:0b:00.0`) and nvidia-smi (`00000000:0B:00.0`) match.
-fn norm_pci(s: &str) -> String {
-    let lower = s.trim().to_ascii_lowercase();
-    match lower.split_once(':') {
-        Some((_, rest)) => rest.to_string(), // drop the domain
-        None => lower,
-    }
 }
 
 fn parse_field<T: std::str::FromStr>(s: &str) -> Option<T> {

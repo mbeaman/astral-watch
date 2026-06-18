@@ -16,6 +16,36 @@ pub struct Config {
     pub alerts: AlertPolicy,
     pub notify: NotifyConfig,
     pub export: Option<ExportConfig>,
+    pub safety: SafetyConfig,
+}
+
+/// Opt-in NVML auto power-cap safety daemon (the `safety` subcommand, built with
+/// `--features safety`). This struct is compiled unconditionally so a `[safety]` block parses
+/// even in the default read-only build (deny_unknown_fields would otherwise reject it); only
+/// the actuating code is feature-gated. See `docs/SAFETY.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SafetyConfig {
+    /// Arm the daemon. OFF by default — this is the only mode that mutates GPU state.
+    pub enabled: bool,
+    /// Cap target as a fraction of the GPU's stock (default) power limit. The daemon never
+    /// *raises* the limit, so the effective cap is `min(this, the limit already in effect)`.
+    pub target_fraction: f64,
+    /// Also cap on a disconnected pin under load (the surviving pins carry its share).
+    pub trigger_disconnect: bool,
+    /// Also cap on imbalance alone (off by default — capping can't change the hi/lo ratio).
+    pub trigger_imbalance: bool,
+}
+
+impl Default for SafetyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            target_fraction: 0.5,
+            trigger_disconnect: true,
+            trigger_imbalance: false,
+        }
+    }
 }
 
 /// Prometheus exporter — presence of the section enables the listener in every mode.
@@ -179,6 +209,10 @@ impl Config {
                 );
             }
         }
+        let f = self.safety.target_fraction;
+        if !f.is_finite() || !(0.1..=1.0).contains(&f) {
+            bail!("safety.target_fraction must be between 0.1 and 1.0 (got {f})");
+        }
         Ok(())
     }
 
@@ -302,6 +336,23 @@ mod tests {
         assert_eq!(cfg.thresholds, crate::alert::Thresholds::default());
         assert_eq!(cfg.alerts, AlertPolicy::default());
         assert!(cfg.notify.ntfy.is_some() && cfg.notify.webhook.is_some());
+    }
+
+    #[test]
+    fn safety_section_parses_and_validates() {
+        let cfg = parse("[safety]\nenabled = true\ntarget_fraction = 0.6\n").unwrap();
+        assert!(cfg.safety.enabled);
+        assert_eq!(cfg.safety.target_fraction, 0.6);
+        // out-of-range fractions rejected (a safety value must be sane)
+        assert!(parse("[safety]\ntarget_fraction = 1.5").is_err());
+        assert!(parse("[safety]\ntarget_fraction = 0.0").is_err());
+        // unknown keys rejected even in the safety table
+        assert!(parse("[safety]\nenabledd = true").is_err());
+        // the section is compiled unconditionally, so the default (read-only) build parses it
+        assert_eq!(
+            parse("[safety]\nenabled = false").unwrap().safety,
+            SafetyConfig::default()
+        );
     }
 
     #[test]

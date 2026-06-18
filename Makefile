@@ -4,7 +4,7 @@ DESTDIR ?=
 UNITDIR = $(if $(DESTDIR),/usr/lib/systemd/system,/etc/systemd/system)
 UDEVDIR = $(if $(DESTDIR),/usr/lib/udev/rules.d,/etc/udev/rules.d)
 
-.PHONY: build release test fmt clippy check install install-files uninstall
+.PHONY: build release test fmt clippy check install install-files install-safety uninstall
 
 build:
 	cargo build
@@ -56,15 +56,37 @@ install-files:
 		echo "Staged install into $(DESTDIR) (no system steps run)."; \
 	fi
 
+# Opt-in NVML auto power-cap daemon: builds the safety-capable binary (pulls nvml-wrapper) and
+# installs everything plus the *disabled* safety unit. The default `install` stays lean and
+# read-only — this target is the deliberate opt-in (see docs/SAFETY.md).
+install-safety:
+	cargo build --release --features safety
+	$(MAKE) install-files
+	install -d $(DESTDIR)$(UNITDIR)
+	sed 's|/usr/local/bin/|$(PREFIX)/bin/|' packaging/astral-watch-safety.service \
+		> $(DESTDIR)$(UNITDIR)/astral-watch-safety.service
+	chmod 644 $(DESTDIR)$(UNITDIR)/astral-watch-safety.service
+	@if [ -z "$(DESTDIR)" ]; then \
+		systemctl daemon-reload && \
+		echo && \
+		echo "Safety daemon installed but DISABLED. It MUTATES GPU state — read docs/SAFETY.md." && \
+		echo "To arm it: set [safety] enabled = true in /etc/astral-watch.toml, then:" && \
+		echo "  sudo systemctl enable --now astral-watch-safety"; \
+	else \
+		echo "Staged safety unit into $(DESTDIR) (disabled; no system steps run)."; \
+	fi
+
 uninstall:
 	@if [ -z "$(DESTDIR)" ]; then \
 		systemctl disable --now astral-watch 2>/dev/null || true; \
+		systemctl disable --now astral-watch-safety 2>/dev/null || true; \
 	fi
 	rm -f $(DESTDIR)$(PREFIX)/bin/astral-watch
 	rm -f $(DESTDIR)$(UDEVDIR)/99-astral-watch.rules
 	rm -f $(DESTDIR)/usr/lib/sysusers.d/astral-watch.conf
 	rm -f $(DESTDIR)/usr/lib/modules-load.d/astral-watch.conf
 	rm -f $(DESTDIR)$(UNITDIR)/astral-watch.service
+	rm -f $(DESTDIR)$(UNITDIR)/astral-watch-safety.service
 	@if [ -z "$(DESTDIR)" ]; then \
 		systemctl daemon-reload && udevadm control --reload; \
 	fi

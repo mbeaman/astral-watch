@@ -5,6 +5,26 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Opt-in NVML safety daemon** (`--features safety`, `astral-watch safety`) — the project's
+  first GPU-state mutation, off by default at three layers (cargo feature + a separate
+  `astral-watch-safety.service` shipped *disabled* + `[safety] enabled = true`). On a confirmed,
+  sustained connector overload (or a disconnected pin under load) it reduces the GPU power limit
+  via NVML to pull per-pin current down. Safety-critical by design: **latched** (no auto-restore
+  — capping is what clears the reading, so auto-restore would flap and false-all-clear),
+  **never-raise** (only ever lowers; refuses + screams when the lever is exhausted),
+  **fail-safe** (holds the cap on exit/crash; a same-boot restart adopts the live cap from
+  `/run`; restore is `astral-watch restore-power-limit` or a reboot), and matched to the
+  monitored card **by PCI id** (never NVML index 0) with a set/read-back confirmation. Runs as a
+  separate privileged unit so the default monitor stays unprivileged and read-only. New
+  `restore-power-limit` subcommand and `make install-safety` target. See `docs/SAFETY.md`.
+
+### Changed
+- `docs/SAFETY.md` / README now state **read-only *by default*** — the opt-in safety daemon is
+  the one documented exception.
+
 ## [0.5.0] - 2026-06-17
 
 ### Added
@@ -128,6 +148,7 @@ Initial release: per-pin 12V-2x6 telemetry (ITE IT8915FN over `/dev/i2c-*`), liv
 auto-rotating CSV logging with falloff capture, overload/disconnect/imbalance alerts,
 hardened systemd service + udev rule, read-only safety design (`docs/SAFETY.md`).
 
+[Unreleased]: https://github.com/mbeaman/astral-watch/compare/v0.5.0...HEAD
 [0.5.0]: https://github.com/mbeaman/astral-watch/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/mbeaman/astral-watch/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/mbeaman/astral-watch/compare/v0.3.0...v0.3.1

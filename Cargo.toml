@@ -33,9 +33,14 @@ signal-hook = "0.4"
 # optional: the `tui` feature pulls ratatui (+crossterm) and raises the MSRV to 1.88; the
 # default build stays dependency-light at 1.85 for the headless service
 ratatui = { version = "0.29", optional = true }
+# optional: the `safety` feature pulls nvml-wrapper for the opt-in auto power-cap daemon.
+# nvml-wrapper dlopens libnvidia-ml at runtime (no link-time dep; builds without a driver)
+# and its MSRV is well below ours, so the default build stays lean and read-only.
+nvml-wrapper = { version = "0.12.1", optional = true }
 
 [features]
 tui = ["dep:ratatui"]
+safety = ["dep:nvml-wrapper"]
 
 [profile.release]
 lto = true

@@ -195,6 +195,16 @@ fn pci_id_from_path(path: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Normalize a PCI id for cross-source matching: lowercase, drop the domain — so the sysfs
+/// form (`0000:0b:00.0`) and the NVML / nvidia-smi form (`00000000:0B:00.0`) compare equal.
+pub fn norm_pci(s: &str) -> String {
+    let lower = s.trim().to_ascii_lowercase();
+    match lower.split_once(':') {
+        Some((_, rest)) => rest.to_string(), // drop the domain
+        None => lower,
+    }
+}
+
 /// Matches a PCI `domain:bus:device.function` slot, e.g. `0000:0b:00.0` (rejects `pci0000:00`).
 fn is_pci_bdf(s: &str) -> bool {
     let b = s.as_bytes();

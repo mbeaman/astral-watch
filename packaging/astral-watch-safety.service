@@ -1,0 +1,45 @@
+[Unit]
+Description=astral-watch safety daemon — NVML auto power-cap on sustained 12V-2x6 overload
+Documentation=https://github.com/mbeaman/astral-watch
+After=multi-user.target
+# WARNING: this unit MUTATES GPU state — on a sustained connector overload it REDUCES the GPU
+# power limit via NVML. It is shipped DISABLED on purpose. Enable it only after reading
+# docs/SAFETY.md, and set `[safety] enabled = true` in /etc/astral-watch.toml.
+
+[Service]
+Type=simple
+ExecStartPre=-/usr/sbin/modprobe i2c-dev
+ExecStart=/usr/local/bin/astral-watch safety --interval 0.5
+Restart=on-failure
+RestartSec=5
+
+# Setting the NVML power limit requires root. Only THIS opt-in unit is privileged; the always-on
+# monitor (astral-watch.service) stays unprivileged and read-only. Every other hardening directive
+# is kept. A latched cap persists across a restart via this tmpfs runtime dir (RuntimeDirectory is
+# writable under ProtectSystem=strict; Preserve=yes keeps the cap-state file until reboot, matching
+# the volatile NVML limit's lifetime).
+User=root
+RuntimeDirectory=astral-watch-safety
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+
+# Hardening (retained despite root)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+DevicePolicy=closed
+DeviceAllow=char-i2c rw
+# NVIDIA control nodes — there is no `char-nvidia` device class, so allow the specific nodes
+DeviceAllow=/dev/nvidiactl rw
+DeviceAllow=/dev/nvidia-uvm rw
+DeviceAllow=/dev/nvidia0 rw
+DeviceAllow=/dev/nvidia1 rw
+DeviceAllow=/dev/nvidia2 rw
+DeviceAllow=/dev/nvidia3 rw
+
+[Install]
+WantedBy=multi-user.target

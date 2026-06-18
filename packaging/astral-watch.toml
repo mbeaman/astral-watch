@@ -44,3 +44,17 @@
 # unauthenticated — bind beyond loopback only on a network you trust.
 #[export]
 #listen = "127.0.0.1:9942"
+
+# Opt-in NVML auto power-cap safety daemon. OFF by default and the ONLY mode that mutates GPU
+# state — read docs/SAFETY.md first. Needs a `--features safety` build (sudo make install-safety)
+# and the separate, disabled astral-watch-safety.service. On a sustained overload it REDUCES the
+# GPU power limit (latched until `astral-watch restore-power-limit` or a reboot).
+[safety]
+# Arm the daemon (set true to enable auto power-capping).
+#enabled = false
+# Cap target as a fraction of the GPU's stock power limit (0.1–1.0). Never raises the limit.
+#target_fraction = 0.5
+# Also cap on a disconnected pin under load (the surviving pins carry its share).
+#trigger_disconnect = true
+# Also cap on imbalance alone (off by default — capping can't change the hi/lo ratio).
+#trigger_imbalance = false
