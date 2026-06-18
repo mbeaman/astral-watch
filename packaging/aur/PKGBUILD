@@ -11,7 +11,7 @@ makedepends=('cargo')
 backup=('etc/astral-watch.toml')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 # refresh with: updpkgsums  (or curl -L <tarball-url> | sha256sum)
-sha256sums=('UPDATE-AFTER-TAG')
+sha256sums=('10755d19e4e311ebad439b16c5a5a810813fff79d7e7f4afe6e83c839d4c8625')
 
 prepare() {
   cd "$pkgname-$pkgver"
