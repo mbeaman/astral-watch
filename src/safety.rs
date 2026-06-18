@@ -135,9 +135,6 @@ fn read_state_at(path: &Path) -> Option<CapState> {
     serde_json::from_slice(&fs::read(path).ok()?).ok()
 }
 
-fn write_state(st: &CapState) -> Result<()> {
-    write_state_at(Path::new(STATE_FILE), st)
-}
 fn read_state() -> Option<CapState> {
     read_state_at(Path::new(STATE_FILE))
 }
@@ -197,23 +194,48 @@ fn set_and_confirm(nvml: &Nvml, pci: &str, target_mw: u32) -> Result<u32> {
         .context("NVML power limit read-back")
 }
 
+/// The GPU power lever, behind a trait so the engage/restore/adopt orchestration can be driven
+/// deterministically by a mock in tests — the actuation path can't otherwise be exercised
+/// without a root NVML write to real hardware.
+trait PowerLever {
+    /// The in-effect management power limit, milliwatts.
+    fn current_mw(&self) -> Result<u32>;
+    /// Set the management limit and return the read-back value (mW).
+    fn set_limit(&mut self, mw: u32) -> Result<u32>;
+}
+
+/// The real lever: re-resolves the device by PCI id on each call (NVML's `Device` borrows the
+/// `Nvml` handle, so it isn't stored across the sampling wait).
+struct NvmlActuator {
+    nvml: Nvml,
+    pci: String,
+}
+
+impl PowerLever for NvmlActuator {
+    fn current_mw(&self) -> Result<u32> {
+        read_current(&self.nvml, &self.pci)
+    }
+    fn set_limit(&mut self, mw: u32) -> Result<u32> {
+        set_and_confirm(&self.nvml, &self.pci, mw)
+    }
+}
+
 enum RestoreOutcome {
     Restored,
     /// The in-effect limit is no longer the value we set — another tool took over; left as-is.
     LeftAlone,
 }
 
-fn restore_to_original(
-    nvml: &Nvml,
-    pci: &str,
+/// Restore the original limit only if the lever still reads what we set (compare-and-author): if
+/// another power-limit manager changed it, leave it alone.
+fn restore_via(
+    lever: &mut dyn PowerLever,
     original_mw: u32,
     capped_mw: u32,
 ) -> Result<RestoreOutcome> {
-    let mut dev = find_device(nvml, pci)?;
-    let cur = dev.power_management_limit().context("NVML current limit")?;
+    let cur = lever.current_mw()?;
     if within(cur, capped_mw, LIMIT_TOL_MW) {
-        dev.set_power_management_limit(original_mw)
-            .context("NVML restore power limit")?;
+        lever.set_limit(original_mw)?;
         Ok(RestoreOutcome::Restored)
     } else {
         Ok(RestoreOutcome::LeftAlone)
@@ -222,15 +244,16 @@ fn restore_to_original(
 
 // ───────────────────────────── the daemon ─────────────────────────────
 
-/// Owns the NVML handle and the engaged-cap state; on drop it HOLDS an engaged cap (never
+/// Owns the power lever and the engaged-cap state; on drop it HOLDS an engaged cap (never
 /// restores on exit — a confirmed overload occurred) and leaves the state file for
 /// `restore-power-limit` or a same-boot restart to adopt.
 struct CapGuard {
-    nvml: Nvml,
+    lever: Box<dyn PowerLever>,
     pci: String,
     original_mw: u32,
     capped_mw: u32,
     engaged: bool,
+    state_path: PathBuf,
 }
 
 impl Drop for CapGuard {
@@ -278,7 +301,7 @@ fn try_engage(
     ts: &str,
     cond: Condition,
 ) {
-    let cur = match read_current(&guard.nvml, &guard.pci) {
+    let cur = match guard.lever.current_mw() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("# safety: cannot read the current power limit to cap: {e:#}");
@@ -295,19 +318,22 @@ fn try_engage(
         }
     };
     match params.decide(cur) {
-        CapDecision::Apply(target) => match set_and_confirm(&guard.nvml, &guard.pci, target) {
+        CapDecision::Apply(target) => match guard.lever.set_limit(target) {
             // success only if the limit actually took AND is a real reduction (NVML rounding near
             // an exhausted lever must never be recorded as a "cap" that didn't lower power)
             Ok(readback) if within(readback, target, LIMIT_TOL_MW) && readback < cur => {
                 guard.original_mw = cur;
                 guard.capped_mw = readback;
                 guard.engaged = true;
-                if let Err(e) = write_state(&CapState {
-                    pci: guard.pci.clone(),
-                    original_mw: cur,
-                    capped_mw: readback,
-                    ts: ts.to_string(),
-                }) {
+                if let Err(e) = write_state_at(
+                    &guard.state_path,
+                    &CapState {
+                        pci: guard.pci.clone(),
+                        original_mw: cur,
+                        capped_mw: readback,
+                        ts: ts.to_string(),
+                    },
+                ) {
                     eprintln!("# safety: warning: could not persist cap state: {e:#} (crash recovery degraded)");
                 }
                 eprintln!(
@@ -472,11 +498,15 @@ pub fn run_safety(
     );
 
     let mut guard = CapGuard {
-        nvml,
+        lever: Box::new(NvmlActuator {
+            nvml,
+            pci: pci.clone(),
+        }),
         pci: pci.clone(),
         original_mw: current_mw,
         capped_mw: 0,
         engaged: false,
+        state_path: PathBuf::from(STATE_FILE),
     };
 
     // Adopt a same-boot cap left by a crash/restart: keep the cap engaged with the TRUE
@@ -563,7 +593,11 @@ pub fn run_restore() -> Result<()> {
         return Ok(());
     };
     let nvml = Nvml::init().context("NVML init failed — cannot restore the power limit")?;
-    match restore_to_original(&nvml, &st.pci, st.original_mw, st.capped_mw)? {
+    let mut lever = NvmlActuator {
+        nvml,
+        pci: st.pci.clone(),
+    };
+    match restore_via(&mut lever, st.original_mw, st.capped_mw)? {
         RestoreOutcome::Restored => eprintln!(
             "restored {} power limit to {}W",
             st.pci,
@@ -687,5 +721,242 @@ mod tests {
     #[test]
     fn pin_count_is_six() {
         assert_eq!(PIN_COUNT, 6);
+    }
+
+    // ── mock-lever orchestration tests: drive the engage/restore/hold state machine that
+    //    otherwise only runs against a root NVML write to real hardware ──
+
+    use std::sync::{Arc, Mutex};
+
+    /// A fake power lever recording every set() into a shared vec so the test can inspect it
+    /// even after the guard (and the boxed lever) drops.
+    struct MockLever {
+        limit: u32,
+        stick: bool, // does a set actually change the limit (vs. silently not taking)?
+        fail: bool,  // does set() error?
+        sets: Arc<Mutex<Vec<u32>>>,
+    }
+    impl PowerLever for MockLever {
+        fn current_mw(&self) -> Result<u32> {
+            Ok(self.limit)
+        }
+        fn set_limit(&mut self, mw: u32) -> Result<u32> {
+            if self.fail {
+                anyhow::bail!("mock set failure");
+            }
+            self.sets.lock().unwrap().push(mw);
+            if self.stick {
+                self.limit = mw;
+            }
+            Ok(self.limit)
+        }
+    }
+
+    fn dispatcher() -> Dispatcher {
+        Dispatcher::from_config(&crate::config::NotifyConfig::default()) // no transports, publish is a no-op
+    }
+    fn params(fraction: f64) -> CapParams {
+        CapParams {
+            default_mw: 575_000,
+            min_mw: 400_000,
+            max_mw: 600_000,
+            fraction,
+        }
+    }
+    fn tmp_state(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("aw-cap-{}-{name}.json", std::process::id()))
+    }
+    fn guard_with(lever: MockLever, state_path: PathBuf) -> CapGuard {
+        CapGuard {
+            lever: Box::new(lever),
+            pci: "0000:0b:00.0".into(),
+            original_mw: 0,
+            capped_mw: 0,
+            engaged: false,
+            state_path,
+        }
+    }
+
+    #[test]
+    fn engage_caps_lowers_and_persists() {
+        let sets = Arc::new(Mutex::new(Vec::new()));
+        let sp = tmp_state("engage");
+        let _ = fs::remove_file(&sp);
+        let mut g = guard_with(
+            MockLever {
+                limit: 600_000,
+                stick: true,
+                fail: false,
+                sets: Arc::clone(&sets),
+            },
+            sp.clone(),
+        );
+        try_engage(
+            &mut g,
+            &dispatcher(),
+            &params(0.5),
+            "2026-06-18T00:00:00",
+            Condition::Overload,
+        );
+        assert!(g.engaged);
+        assert_eq!(g.original_mw, 600_000);
+        assert_eq!(g.capped_mw, 400_000); // 50% of 575W -> clamped up to the 400W floor
+        assert_eq!(*sets.lock().unwrap(), vec![400_000]);
+        let st = read_state_at(&sp).expect("cap state persisted");
+        assert_eq!((st.original_mw, st.capped_mw), (600_000, 400_000));
+        let _ = fs::remove_file(&sp);
+    }
+
+    #[test]
+    fn engage_exhausted_on_undervolted_card_does_not_write() {
+        let sets = Arc::new(Mutex::new(Vec::new()));
+        let sp = tmp_state("exhausted");
+        let _ = fs::remove_file(&sp);
+        // already undervolted to 250W: the 400W-floor target is HIGHER -> never raise, never write
+        let mut g = guard_with(
+            MockLever {
+                limit: 250_000,
+                stick: true,
+                fail: false,
+                sets: Arc::clone(&sets),
+            },
+            sp.clone(),
+        );
+        try_engage(
+            &mut g,
+            &dispatcher(),
+            &params(0.5),
+            "t",
+            Condition::Overload,
+        );
+        assert!(!g.engaged);
+        assert!(
+            sets.lock().unwrap().is_empty(),
+            "must not write when exhausted"
+        );
+        assert!(read_state_at(&sp).is_none());
+    }
+
+    #[test]
+    fn engage_does_not_record_a_cap_that_did_not_stick() {
+        let sets = Arc::new(Mutex::new(Vec::new()));
+        let sp = tmp_state("nostick");
+        let _ = fs::remove_file(&sp);
+        // set() is attempted but the limit doesn't change (driver bug / contention)
+        let mut g = guard_with(
+            MockLever {
+                limit: 600_000,
+                stick: false,
+                fail: false,
+                sets: Arc::clone(&sets),
+            },
+            sp.clone(),
+        );
+        try_engage(
+            &mut g,
+            &dispatcher(),
+            &params(0.5),
+            "t",
+            Condition::Overload,
+        );
+        assert!(
+            !g.engaged,
+            "a cap that didn't take must not be recorded as protected"
+        );
+        assert_eq!(
+            *sets.lock().unwrap(),
+            vec![400_000],
+            "the set was attempted"
+        );
+        assert!(read_state_at(&sp).is_none());
+    }
+
+    #[test]
+    fn engage_set_error_does_not_engage() {
+        let sets = Arc::new(Mutex::new(Vec::new()));
+        let sp = tmp_state("setfail");
+        let _ = fs::remove_file(&sp);
+        let mut g = guard_with(
+            MockLever {
+                limit: 600_000,
+                stick: true,
+                fail: true,
+                sets: Arc::clone(&sets),
+            },
+            sp.clone(),
+        );
+        try_engage(
+            &mut g,
+            &dispatcher(),
+            &params(0.5),
+            "t",
+            Condition::Overload,
+        );
+        assert!(!g.engaged);
+        assert!(read_state_at(&sp).is_none());
+    }
+
+    #[test]
+    fn drop_holds_an_engaged_cap_and_never_restores() {
+        let sets = Arc::new(Mutex::new(Vec::new()));
+        let sp = tmp_state("hold");
+        let _ = fs::remove_file(&sp);
+        {
+            let mut g = guard_with(
+                MockLever {
+                    limit: 600_000,
+                    stick: true,
+                    fail: false,
+                    sets: Arc::clone(&sets),
+                },
+                sp.clone(),
+            );
+            try_engage(
+                &mut g,
+                &dispatcher(),
+                &params(0.5),
+                "t",
+                Condition::Overload,
+            );
+            assert!(g.engaged);
+            assert_eq!(*sets.lock().unwrap(), vec![400_000]);
+        } // guard drops here — must HOLD the cap, not restore
+        assert_eq!(
+            *sets.lock().unwrap(),
+            vec![400_000],
+            "Drop must not issue a restoring set"
+        );
+        let _ = fs::remove_file(&sp);
+    }
+
+    #[test]
+    fn restore_respects_compare_and_author() {
+        // still our cap -> restored
+        let sets = Arc::new(Mutex::new(Vec::new()));
+        let mut ours = MockLever {
+            limit: 400_000,
+            stick: true,
+            fail: false,
+            sets: Arc::clone(&sets),
+        };
+        assert!(matches!(
+            restore_via(&mut ours, 600_000, 400_000).unwrap(),
+            RestoreOutcome::Restored
+        ));
+        assert_eq!(*sets.lock().unwrap(), vec![600_000]);
+
+        // another tool moved it -> leave it alone, no set
+        let sets2 = Arc::new(Mutex::new(Vec::new()));
+        let mut changed = MockLever {
+            limit: 500_000,
+            stick: true,
+            fail: false,
+            sets: Arc::clone(&sets2),
+        };
+        assert!(matches!(
+            restore_via(&mut changed, 600_000, 400_000).unwrap(),
+            RestoreOutcome::LeftAlone
+        ));
+        assert!(sets2.lock().unwrap().is_empty());
     }
 }
